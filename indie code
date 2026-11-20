@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from dotenv import load_dotenv
 from decimal import Decimal
-APP_VERSION = "1.7.5"
+APP_VERSION = "1.7.6"
 UTC = timezone.utc
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -433,6 +433,11 @@ class ExnessAPI:
             "comment": "KS Trader Desk Entry 1",
         }
         return self.post(f"/v1/trading/accounts/{self.cfg.account_id}/orders", body, idem=idem)
+
+    def cancel_pending_order(self, order_id: str, idem: str) -> dict:
+        """Request cancellation of a pending order; Exness finalizes asynchronously."""
+        path = f"/v1/trading/accounts/{self.cfg.account_id}/orders/{order_id}"
+        return self.request("DELETE", path, idem=idem)
 
     def modify_active_order(self, order_id: str, stop_loss_text: str, idem: str) -> dict:
         """Modify the SL on the active SLTP order linked to an open position.
@@ -1569,7 +1574,7 @@ def _match_submission_order(
     return matches[0][1]
 
 
-def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instrument: str) -> bool:
+def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instrument: str, m1: pd.DataFrame | None = None) -> bool:
     """Hold one-trade lock until a linked Exness SL/TP closing deal is confirmed."""
     lock = store.get_json("trade_lock", {}) or {}
     if not lock.get("active"):
@@ -1599,6 +1604,90 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
             lock["order_id"] = str(found["order_id"])
         if found.get("position_id"):
             lock["position_id"] = str(found["position_id"])
+
+        # If price reaches the pending order's TP before its entry is touched,
+        # the setup has already played out without an open position. Cancel it.
+        # Never treat a pending order's TP as a position close.
+        cancel_state = str(lock.get("state", "")).lower()
+        if cancel_state == "pending_tp_cancel_requested":
+            store.set_json("trade_lock", lock)
+            logging.warning(
+                "PENDING ORDER CANCELLATION IS STILL BEING RECONCILED for order %s. No new order will be submitted until Exness confirms its final state.",
+                lock.get("order_id"),
+            )
+            return True
+
+        side = str(found.get("direction") or lock.get("side") or "").lower()
+        entry_raw = found.get("price") or lock.get("entry")
+        tp_raw = found.get("take_profit_price") or lock.get("tp")
+        tp_crossed_before_entry = False
+        if m1 is not None and not m1.empty and side in {"buy", "sell"} and entry_raw not in (None, "") and tp_raw not in (None, ""):
+            last = m1.iloc[-1]
+            entry_price = float(dec(entry_raw))
+            tp_price = float(dec(tp_raw))
+            candle_high = float(last["high"])
+            candle_low = float(last["low"])
+            if side == "sell":
+                # Sell Limit entry is above market; TP is below entry.
+                tp_crossed_before_entry = candle_low <= tp_price and candle_high < entry_price
+            else:
+                # Buy Limit entry is below market; TP is above entry.
+                tp_crossed_before_entry = candle_high >= tp_price and candle_low > entry_price
+
+        if tp_crossed_before_entry:
+            order_id = str(found.get("order_id") or "")
+            if not order_id:
+                raise RuntimeError("Pending order reached its TP before entry but Exness did not provide order_id; refusing to guess which order to cancel.")
+            cancel_idem = "KS-CANCEL-" + uuid.uuid4().hex
+            lock["state"] = "pending_tp_cancel_requested"
+            lock["cancel_reason"] = "tp_reached_before_entry"
+            lock["cancel_requested_at"] = utc_iso(datetime.now(UTC))
+            store.set_json("trade_lock", lock)
+            logging.warning(
+                "INVALID PENDING SETUP: %s LIMIT order %s reached its TP (%s) before entry (%s). Requesting cancellation; this is NOT recorded as a trade win/loss.",
+                side.upper(), order_id, tp_raw, entry_raw,
+            )
+            try:
+                ack = api.cancel_pending_order(order_id, idem=cancel_idem)
+            except UncertainPostError:
+                logging.error(
+                    "PENDING ORDER CANCEL STATUS UNCERTAIN for order %s. The bot will not retry blindly; it will reconcile the Exness snapshot before any new entry.",
+                    order_id,
+                )
+                return True
+            operation_id = ack.get("operation_id")
+            if operation_id:
+                lock["cancel_operation_id"] = str(operation_id)
+                store.set_json("trade_lock", lock)
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    status_doc = api.operation_status(str(operation_id))
+                    op_state = str(status_doc.get("status", "")).lower()
+                    if op_state in {"confirmed", "completed", "succeeded", "success"}:
+                        fresh = api.snapshot()
+                        fresh_orders, fresh_positions = instrument_activity(fresh, instrument)
+                        still_pending = any(str(o.get("order_id", "")) == order_id for o in fresh_orders)
+                        if still_pending:
+                            logging.warning("Exness confirmed the cancellation operation but the pending order is still visible. Keeping the trade lock until the next snapshot reconciliation.")
+                            return True
+                        lock.update({
+                            "active": False,
+                            "state": "cancelled_unfilled_tp_reached",
+                            "resolved_at": utc_iso(datetime.now(UTC)),
+                        })
+                        store.set_json("trade_lock", lock)
+                        logging.info("PENDING ORDER CANCELLED: TP was reached before entry. No position was opened, no P/L is booked, and the bot can look for a fresh setup.")
+                        return False
+                    if op_state in {"rejected", "failed"}:
+                        lock["state"] = "pending_order_cancel_rejected"
+                        lock["cancel_error"] = status_doc
+                        store.set_json("trade_lock", lock)
+                        logging.error("Exness rejected cancellation of pending order %s. The order remains locked for manual review; no replacement order will be submitted.", order_id)
+                        return True
+                    time.sleep(1)
+            logging.warning("Exness accepted the cancellation request but has not confirmed the final result. Keeping the trade lock and reconciling the pending order on the next cycle.")
+            return True
+
         lock["state"] = "pending_order"
         store.set_json("trade_lock", lock)
         if old_state != "pending_order":
@@ -2200,7 +2289,7 @@ def main() -> int:
 
             snap = api.snapshot()
             active_orders, open_positions = instrument_activity(snap, cfg.instrument)
-            trade_locked = refresh_trade_lock(store, api, snap, cfg.instrument)
+            trade_locked = refresh_trade_lock(store, api, snap, cfg.instrument, m1)
             daily_opening_balance, daily_balance_date = get_daily_opening_balance(store, api, snap)
             daily_risk_state = get_daily_risk_state(store, daily_opening_balance, daily_balance_date)
             unresolved = pending_submission_blocks(store, snap, cfg.instrument)
