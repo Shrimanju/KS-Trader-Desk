@@ -2292,7 +2292,11 @@ if self.is_closed_bar:
             # signal candle's opposite extreme. No P/L is booked
             # for a setup that expires without an entry.
             # ------------------------------------------------
-            if pending_trade_side[0] != 0.0:
+            if (
+                pending_trade_side[0] != 0.0
+                and side[0] == 0.0
+                and not trade_exited
+            ):
 
                 pending_setup_was_checked = True
                 pending_midpoint_value = pending_trade_entry[0]
