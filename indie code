@@ -27,7 +27,7 @@ from indie.drawings import (
 
 # Adaptive hybrid trailing is a visual/backtest stop manager for M1 charts.
 
-# Entry 1 is simulated at the next candle OPEN after signal confirmation closes.
+# Entry 1 uses the original candle midpoint: (high + low) / 2.
 # It does not send or modify broker orders.
 
 # ============================================================
@@ -392,12 +392,11 @@ class Main(MainContext):
         last_entry_bar = MutSeriesF.new(init=-1.0)
         last_entry_price = MutSeriesF.new(init=nan)
 
-        # Pending Entry 1 lifecycle. The signal candle closes first;
-        # the simulated market entry is the OPEN of the next chart candle.
+        # Pending Entry 1 lifecycle. A setup is not active until a later
+        # completed candle reaches its planned midpoint entry.
         pending_trade_side = MutSeriesF.new(init=0.0)
         pending_trade_entry = MutSeriesF.new(init=nan)
         pending_trade_sl = MutSeriesF.new(init=nan)
-        pending_trade_signal_range = MutSeriesF.new(init=nan)
         pending_trade_tp = MutSeriesF.new(init=nan)
         pending_trade_lot = MutSeriesF.new(init=nan)
         pending_trade_risk_cash = MutSeriesF.new(init=nan)
@@ -524,7 +523,6 @@ class Main(MainContext):
             pending_trade_side[0] = pending_trade_side[1]
             pending_trade_entry[0] = pending_trade_entry[1]
             pending_trade_sl[0] = pending_trade_sl[1]
-            pending_trade_signal_range[0] = pending_trade_signal_range[1]
             pending_trade_tp[0] = pending_trade_tp[1]
             pending_trade_lot[0] = pending_trade_lot[1]
             pending_trade_risk_cash[0] = pending_trade_risk_cash[1]
@@ -654,7 +652,6 @@ class Main(MainContext):
             pending_trade_side[0] = 0.0
             pending_trade_entry[0] = nan
             pending_trade_sl[0] = nan
-            pending_trade_signal_range[0] = nan
             pending_trade_tp[0] = nan
             pending_trade_lot[0] = nan
             pending_trade_risk_cash[0] = nan
@@ -1476,81 +1473,69 @@ class Main(MainContext):
         report_hit_tp = False
         report_hit_trailing_sl = False
 
-        # Activate Entry 1 at the NEXT candle OPEN after the signal candle
-        # has closed. Use the open as the simulated market fill; do not inspect
-        # that candle's later high/low to decide whether entry happened.
+        # Resolve pending setups before managing active-trade exits. The
+        # confirmation candle is deliberately excluded: its midpoint is
+        # inside its own range and must not self-trigger the pending entry.
         if (
             self.is_closed_bar
             and pending_trade_side[0] != 0.0
             and self.bar_index > pending_trade_setup_bar[0]
         ):
             pending_side_value = pending_trade_side[0]
-            pending_entry_value = self.open[0]
-            pending_structure_sl = pending_trade_sl[0]
-            pending_signal_range = pending_trade_signal_range[0]
-            pending_actual_sl = nan
-            pending_tp_value = nan
+            pending_entry_value = pending_trade_entry[0]
+            pending_sl_value = pending_trade_sl[0]
+            pending_tp_value = pending_trade_tp[0]
 
-            pending_trade_stale = self.bar_index > pending_trade_setup_bar[0] + 1.0
-            pending_entry_valid = False
+            # Declare touch flags in the enclosing scope. Indie scopes variables
+            # declared inside an if/else block to that indentation block.
+            pending_entry_touched = False
+            pending_sl_touched = False
+            pending_tp_touched = False
 
-            # If this is the first bar after the setup, use its OPEN as the
-            # fill. Recalculate SL distance, lot size and TP from that price.
-            if not pending_trade_stale:
-                # Reject a gap through the original 8-candle structure.
-                # Rebuild the existing protective buffer from the actual fill.
-                pending_stop_valid = (
-                    pending_structure_sl < pending_entry_value
-                    if pending_side_value == 1.0
-                    else pending_structure_sl > pending_entry_value
-                )
-                pending_entry_stop_buffer = max(
-                    pending_signal_range * 0.25,
-                    abs(pending_entry_value) * 0.00005
-                )
-                if pending_side_value == 1.0:
-                    pending_actual_sl = min(
-                        pending_structure_sl,
-                        pending_entry_value - pending_entry_stop_buffer
+            if pending_side_value == 1.0:
+                pending_entry_touched = self.low[0] <= pending_entry_value
+                pending_sl_touched = self.low[0] <= pending_sl_value
+                pending_tp_touched = self.high[0] >= pending_tp_value
+            else:
+                pending_entry_touched = self.high[0] >= pending_entry_value
+                pending_sl_touched = self.high[0] >= pending_sl_value
+                pending_tp_touched = self.low[0] <= pending_tp_value
+
+            pending_exit_touched = pending_sl_touched or pending_tp_touched
+            if pending_exit_touched:
+                # Conservative rule: if entry and pre-entry SL/TP are touched
+                # in the same candle, the order is Inactive, never a trade.
+                if pending_trade_setup_day[0] == self._selected_report_day_key:
+                    report_inactive_trades[0] = report_inactive_trades[0] + 1.0
+                    report_trades[0] = report_active_trades[0] + report_inactive_trades[0]
+
+                    # Hypothetical inactive-order P/L: deliberately ignore whether
+                    # the planned entry was reached. Use the original planned
+                    # entry/SL/TP and conservative SL-first same-candle handling.
+                    inactive_exit_price = pending_sl_value if pending_sl_touched else pending_tp_value
+                    inactive_result = (
+                        (inactive_exit_price - pending_entry_value)
+                        * pending_side_value
+                        * self.contract_size
+                        * pending_trade_lot[0]
                     )
-                else:
-                    pending_actual_sl = max(
-                        pending_structure_sl,
-                        pending_entry_value + pending_entry_stop_buffer
-                    )
-                pending_risk_distance = abs(pending_entry_value - pending_actual_sl)
-                pending_risk_per_lot = pending_risk_distance * self.contract_size
-                pending_total_risk_percent = total_risk_percent
-                pending_risk_budget_cash = self.account_capital * pending_total_risk_percent / 100.0
-                pending_calculated_lot = 0.0
-                pending_calculated_risk_cash = nan
-
-                if (
-                    pending_stop_valid
-                    and pending_risk_distance > 0.0
-                    and pending_risk_distance <= maximum_allowed_sl_distance
-                    and pending_risk_per_lot > 0.0
-                    and pending_risk_budget_cash > 0.0
-                ):
-                    pending_raw_lot = pending_risk_budget_cash / pending_risk_per_lot
-                    pending_calculated_lot = int(pending_raw_lot * 100.0) / 100.0
-                    pending_calculated_risk_cash = pending_calculated_lot * pending_risk_per_lot
-
-                    if pending_calculated_lot >= 0.01:
-                        pending_entry_valid = True
-                        if pending_side_value == 1.0:
-                            pending_tp_value = pending_entry_value + pending_risk_distance * rr_multiplier
-                        else:
-                            pending_tp_value = pending_entry_value - pending_risk_distance * rr_multiplier
-
-            if pending_entry_valid:
+                    report_inactive_pnl[0] = report_inactive_pnl[0] + inactive_result
+                pending_trade_side[0] = 0.0
+                pending_trade_entry[0] = nan
+                pending_trade_sl[0] = nan
+                pending_trade_tp[0] = nan
+                pending_trade_lot[0] = nan
+                pending_trade_risk_cash[0] = nan
+                pending_trade_setup_day[0] = nan
+                pending_trade_setup_bar[0] = -1.0
+            elif pending_entry_touched:
                 entry[0] = pending_entry_value
-                sl[0] = pending_actual_sl
+                sl[0] = pending_sl_value
                 tp[0] = pending_tp_value
                 side[0] = pending_side_value
-                trade_lot[0] = pending_calculated_lot
-                trade_risk_cash[0] = pending_calculated_risk_cash
-                original_risk_distance[0] = abs(pending_entry_value - pending_actual_sl)
+                trade_lot[0] = pending_trade_lot[0]
+                trade_risk_cash[0] = pending_trade_risk_cash[0]
+                original_risk_distance[0] = abs(pending_entry_value - pending_sl_value)
                 favorable_extreme[0] = pending_entry_value
                 trail_candidate[0] = nan
                 trail_confirm_count[0] = 0.0
@@ -1564,22 +1549,14 @@ class Main(MainContext):
                 if pending_trade_setup_day[0] == self._selected_report_day_key:
                     report_active_trades[0] = report_active_trades[0] + 1.0
                     report_trades[0] = report_active_trades[0] + report_inactive_trades[0]
-            else:
-                # Invalid gap-through, oversized stop, missing risk capacity,
-                # or expired setup: no position and no hypothetical P/L.
-                if pending_trade_setup_day[0] == self._selected_report_day_key:
-                    report_inactive_trades[0] = report_inactive_trades[0] + 1.0
-                    report_trades[0] = report_active_trades[0] + report_inactive_trades[0]
-
-            pending_trade_side[0] = 0.0
-            pending_trade_entry[0] = nan
-            pending_trade_sl[0] = nan
-            pending_trade_signal_range[0] = nan
-            pending_trade_tp[0] = nan
-            pending_trade_lot[0] = nan
-            pending_trade_risk_cash[0] = nan
-            pending_trade_setup_day[0] = nan
-            pending_trade_setup_bar[0] = -1.0
+                pending_trade_side[0] = 0.0
+                pending_trade_entry[0] = nan
+                pending_trade_sl[0] = nan
+                pending_trade_tp[0] = nan
+                pending_trade_lot[0] = nan
+                pending_trade_risk_cash[0] = nan
+                pending_trade_setup_day[0] = nan
+                pending_trade_setup_bar[0] = -1.0
 
         if self.is_closed_bar:
 
@@ -2336,7 +2313,7 @@ class Main(MainContext):
             ):
 
                 # Preserve the original signal conditions without a deviation
-                # filter. The signal candle closes; fill occurs next candle open.
+                # filter. Entry 1 uses the confirmation candle midpoint.
                 sell_entry_ready = sell_condition or sell_breakout_pullback_ready
                 buy_entry_ready = buy_condition or buy_breakout_pullback_ready
 
@@ -2349,28 +2326,53 @@ class Main(MainContext):
                         self.high[6], self.high[7]
                     ])
 
-                    # Store the 8-candle structure. The protective buffer,
-                    # risk, lot and TP are recalculated from the next candle OPEN.
-                    entry_price = self.open[0]
+                    # Original Entry 1 logic: confirmation candle midpoint.
+                    entry_price = candidate_entry_price
 
                     if sell_breakout_pullback_ready:
                         sell_reason = 'BREAKOUT + VOLUME PULLBACK'
 
                     stop_price = recent_high
 
-                    # Validate the signal candle only; actual stop distance
-                    # is checked again using the next candle's opening price.
+                    entry_stop_buffer = max(
+                        candle_range * 0.25,
+                        abs(entry_price) * 0.00005
+                    )
+
+                    stop_price = max(
+                        stop_price,
+                        entry_price + entry_stop_buffer
+                    )
+
                     risk = stop_price - entry_price
                     sl_distance = abs(entry_price - stop_price)
+                    risk_per_one_lot = sl_distance * self.contract_size
+                    calculated_lot = 0.0
+                    calculated_risk_cash = nan
 
-                    if risk > 0.0 and sl_distance > 0.0:
+                    if risk_per_one_lot > 0.0 and risk_budget_cash > 0.0:
+                        raw_lot = risk_budget_cash / risk_per_one_lot
+                        calculated_lot = int(raw_lot * 100.0) / 100.0
+                        calculated_risk_cash = (
+                            calculated_lot * risk_per_one_lot
+                        )
+
+                    if (
+                        risk > 0.0
+                        and sl_distance <= maximum_allowed_sl_distance
+                        and calculated_lot >= 0.01
+                    ):
+
+                        target_price = entry_price - risk * rr_multiplier
+
+                        # Save the planned trade as pending. It becomes active
+                        # only when a later completed candle reaches entry.
                         pending_trade_side[0] = -1.0
                         pending_trade_entry[0] = entry_price
-                        pending_trade_sl[0] = recent_high
-                        pending_trade_signal_range[0] = candle_range
-                        pending_trade_tp[0] = nan
-                        pending_trade_lot[0] = nan
-                        pending_trade_risk_cash[0] = nan
+                        pending_trade_sl[0] = stop_price
+                        pending_trade_tp[0] = target_price
+                        pending_trade_lot[0] = calculated_lot
+                        pending_trade_risk_cash[0] = calculated_risk_cash
                         pending_trade_setup_day[0] = current_ist_day_key
                         pending_trade_setup_bar[0] = float(self.bar_index)
 
@@ -2409,28 +2411,53 @@ class Main(MainContext):
                         self.low[6], self.low[7]
                     ])
 
-                    # Store the 8-candle structure. The protective buffer,
-                    # risk, lot and TP are recalculated from the next candle OPEN.
-                    entry_price = self.open[0]
+                    # Original Entry 1 logic: confirmation candle midpoint.
+                    entry_price = candidate_entry_price
 
                     if buy_breakout_pullback_ready:
                         buy_reason = 'BREAKOUT + VOLUME PULLBACK'
 
                     stop_price = recent_low
 
-                    # Validate the signal candle only; actual stop distance
-                    # is checked again using the next candle's opening price.
+                    entry_stop_buffer = max(
+                        candle_range * 0.25,
+                        abs(entry_price) * 0.00005
+                    )
+
+                    stop_price = min(
+                        stop_price,
+                        entry_price - entry_stop_buffer
+                    )
+
                     risk = entry_price - stop_price
                     sl_distance = abs(entry_price - stop_price)
+                    risk_per_one_lot = sl_distance * self.contract_size
+                    calculated_lot = 0.0
+                    calculated_risk_cash = nan
 
-                    if risk > 0.0 and sl_distance > 0.0:
+                    if risk_per_one_lot > 0.0 and risk_budget_cash > 0.0:
+                        raw_lot = risk_budget_cash / risk_per_one_lot
+                        calculated_lot = int(raw_lot * 100.0) / 100.0
+                        calculated_risk_cash = (
+                            calculated_lot * risk_per_one_lot
+                        )
+
+                    if (
+                        risk > 0.0
+                        and sl_distance <= maximum_allowed_sl_distance
+                        and calculated_lot >= 0.01
+                    ):
+
+                        target_price = entry_price + risk * rr_multiplier
+
+                        # Save the planned trade as pending. It becomes active
+                        # only when a later completed candle reaches entry.
                         pending_trade_side[0] = 1.0
                         pending_trade_entry[0] = entry_price
-                        pending_trade_sl[0] = recent_low
-                        pending_trade_signal_range[0] = candle_range
-                        pending_trade_tp[0] = nan
-                        pending_trade_lot[0] = nan
-                        pending_trade_risk_cash[0] = nan
+                        pending_trade_sl[0] = stop_price
+                        pending_trade_tp[0] = target_price
+                        pending_trade_lot[0] = calculated_lot
+                        pending_trade_risk_cash[0] = calculated_risk_cash
                         pending_trade_setup_day[0] = current_ist_day_key
                         pending_trade_setup_bar[0] = float(self.bar_index)
 
@@ -2764,8 +2791,8 @@ class Main(MainContext):
                 + ('$' + str(round(report_active_pnl[0], 2))).ljust(value_width) + ' |'
             )
             inactive_pnl_row = (
-                '| ' + 'Invalid / Unfilled Setups'.ljust(label_width) + ' | '
-                + str(inactive_trades).ljust(value_width) + ' |'
+                '| ' + 'Inactive Trade P/L'.ljust(label_width) + ' | '
+                + ('$' + str(round(report_inactive_pnl[0], 2))).ljust(value_width) + ' |'
             )
 
             sl_row = (
