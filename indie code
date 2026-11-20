@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from dotenv import load_dotenv
 from decimal import Decimal
-APP_VERSION = "1.7.4"
+APP_VERSION = "1.7.5"
 UTC = timezone.utc
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -573,6 +573,100 @@ def get_daily_opening_balance(store: StateStore, api: ExnessAPI, snapshot: dict)
     return opening_balance, day_key
 
 
+
+def get_daily_risk_state(store: StateStore, opening_balance: Decimal, day_key: str) -> dict:
+    """Load/create the IST day's persistent closed-P/L risk mode."""
+    state = store.get_json("daily_risk_state", {}) or {}
+    if state.get("date_ist") != day_key:
+        state = {
+            "date_ist": day_key,
+            "opening_balance": str(opening_balance),
+            "realized_closed_pnl": "0",
+            "reduced_mode": False,
+            "processed_position_ids": [],
+            "updated_at": utc_iso(datetime.now(UTC)),
+        }
+        store.set_json("daily_risk_state", state)
+        logging.info(
+            "Daily capital protection initialized: opening balance $%.2f; 30%% loss threshold $%.2f; NORMAL risk 5%% + 2%%.",
+            float(opening_balance), float(opening_balance * Decimal("0.30")),
+        )
+        return state
+    state.setdefault("realized_closed_pnl", "0")
+    state.setdefault("reduced_mode", False)
+    state.setdefault("processed_position_ids", [])
+    return state
+
+
+def record_daily_closed_trade(
+    store: StateStore,
+    opening_balance: Decimal,
+    day_key: str,
+    position_id: str,
+    realized_pnl: Decimal,
+    exit_reason: str,
+) -> dict:
+    """Apply one broker-confirmed SL/TP result once; supports repeated mode changes."""
+    if exit_reason not in {"SL", "TP"}:
+        return get_daily_risk_state(store, opening_balance, day_key)
+    state = get_daily_risk_state(store, opening_balance, day_key)
+    pid = str(position_id or "")
+    if not pid:
+        raise RuntimeError("Cannot update daily risk without a confirmed position ID.")
+    processed = set(str(x) for x in state.get("processed_position_ids", []))
+    if pid in processed:
+        return state
+
+    new_pnl = dec(state.get("realized_closed_pnl", "0")) + realized_pnl
+    threshold = dec(state["opening_balance"]) * Decimal("0.30")
+    was_reduced = bool(state.get("reduced_mode", False))
+    if new_pnl <= -threshold:
+        reduced = True
+    elif new_pnl >= Decimal("0"):
+        reduced = False
+    else:
+        reduced = was_reduced
+
+    processed.add(pid)
+    state.update({
+        "realized_closed_pnl": str(new_pnl),
+        "reduced_mode": reduced,
+        "processed_position_ids": sorted(processed),
+        "updated_at": utc_iso(datetime.now(UTC)),
+        "last_closed_position_id": pid,
+        "last_exit_reason": exit_reason,
+        "last_trade_realized_pnl": str(realized_pnl),
+    })
+    store.set_json("daily_risk_state", state)
+
+    if reduced and not was_reduced:
+        logging.warning(
+            "CAPITAL PROTECTION ACTIVATED: Daily closed P/L $%.2f reached the 30%% loss threshold (-$%.2f). New trades use 3%% + 1%% risk.",
+            float(new_pnl), float(threshold),
+        )
+    elif was_reduced and not reduced:
+        logging.info(
+            "CAPITAL PROTECTION CLEARED: Daily closed P/L recovered to $%.2f. New trades return to 5%% + 2%% risk.",
+            float(new_pnl),
+        )
+    else:
+        logging.info(
+            "Daily closed P/L: $%.2f | Risk mode: %s",
+            float(new_pnl), "REDUCED 3% + 1%" if reduced else "NORMAL 5% + 2%",
+        )
+    return state
+
+
+def daily_risk_parameters(cfg: Config, opening_balance: Decimal, state: dict) -> tuple[float, float, Decimal]:
+    """Return current target, buffer and cash budget for the next new entry."""
+    if bool(state.get("reduced_mode", False)):
+        target, buffer = 3.0, 1.0
+    else:
+        target, buffer = cfg.risk_percent, cfg.risk_buffer_percent
+    total = min(Decimal("7.0"), dec(target) + dec(buffer))
+    return target, buffer, opening_balance * total / Decimal("100")
+
+
 # ---------- Indicator calculations ----------
 def _indie_rma(series: pd.Series, length: int) -> pd.Series:
     """Reproduce Indie Rma: SMA seed, then Wilder recursive smoothing."""
@@ -666,7 +760,7 @@ def volume_string(lot: float, conditions: dict) -> str:
     return format(actual, "f")
 
 
-def compute_signal(m1: pd.DataFrame, m3: pd.DataFrame, cfg: Config, pending: dict) -> tuple[dict | None, dict]:
+def compute_signal(m1: pd.DataFrame, m3: pd.DataFrame, cfg: Config, pending: dict, risk_target_percent: float | None = None, risk_buffer_percent: float | None = None) -> tuple[dict | None, dict]:
     """Port of the supplied indicator's 1m configuration; closed bars only."""
     if len(m1) < 210 or len(m3) < 55:
         logging.info("Waiting for more completed 1-minute and 3-minute market data.")
@@ -858,7 +952,9 @@ def compute_signal(m1: pd.DataFrame, m3: pd.DataFrame, cfg: Config, pending: dic
         recent_high = d.iloc[i-7:i+1]["high"].max()
         stop = max(recent_high, entry + stop_buffer)
         risk = stop - entry
-    total_risk_percent = min(7.0, cfg.risk_percent + cfg.risk_buffer_percent)
+    active_target = cfg.risk_percent if risk_target_percent is None else risk_target_percent
+    active_buffer = cfg.risk_buffer_percent if risk_buffer_percent is None else risk_buffer_percent
+    total_risk_percent = min(7.0, active_target + active_buffer)
     risk_budget_cash = cfg.account_capital * total_risk_percent / 100.0
     risk_per_one_lot = risk * cfg.contract_size
     lot = 0.0
@@ -1772,6 +1868,33 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
                 market_close_metadata["realized_profit"] = str(sum(profit_values, Decimal("0")))
 
     if exit_order and exit_reason:
+        if exit_reason in {"SL", "TP"}:
+            close_order_id = str(exit_order.get("order_id") or "")
+            close_deal = next(
+                (deal for deal in historical_deals
+                 if str(deal.get("position_id", "")) == locked_position_id
+                 and str(deal.get("type", "")).lower() == "close"
+                 and str(deal.get("order_id", "")) == close_order_id),
+                None,
+            )
+            if close_deal is None:
+                raise RuntimeError("Exness confirmed an SL/TP exit but its matching close deal is missing; retry reconciliation before new entries.")
+            profit = close_deal.get("profit")
+            if not isinstance(profit, dict) or profit.get("amount") in (None, ""):
+                raise RuntimeError("Confirmed SL/TP close deal has no profit.amount; refusing to change daily risk mode.")
+            closed_pnl = dec(profit["amount"])
+            if close_deal.get("commission") not in (None, ""):
+                closed_pnl += dec(close_deal["commission"])
+            close_time = _history_time(close_deal.get("create_time")) or _history_time(exit_order.get("update_time"))
+            if close_time is None:
+                raise RuntimeError("Confirmed SL/TP close deal has no valid timestamp; refusing to assign it to an IST day.")
+            close_day = close_time.astimezone(IST).date().isoformat()
+            opening = store.get_json("daily_opening_balance", {}) or {}
+            if opening.get("date_ist") == close_day and opening.get("opening_balance") is not None:
+                record_daily_closed_trade(
+                    store, dec(opening["opening_balance"]), close_day,
+                    locked_position_id, closed_pnl, exit_reason,
+                )
         lock.update({
             "active": False,
             "state": f"closed_by_{exit_reason.lower()}",
@@ -1821,7 +1944,7 @@ def display_trade_dashboard(store: StateStore, snapshot: dict, m1: pd.DataFrame,
                             instrument: str, account_mode: str, contract_size: float,
                             daily_opening_balance: float, risk_percent: float,
                             risk_buffer_percent: float, conditions: dict,
-                            trailing_enabled: bool) -> None:
+                            trailing_enabled: bool, daily_risk_state: dict | None = None) -> None:
     """Print a concise, human-readable CMD dashboard from broker-confirmed data."""
     orders, positions = instrument_activity(snapshot, instrument)
     digits = int(conditions.get("point_digits", 3) or 3)
@@ -1899,14 +2022,18 @@ def display_trade_dashboard(store: StateStore, snapshot: dict, m1: pd.DataFrame,
                   "Safety        : No second XAUUSD entry will be placed while this order is active"]
     else:
         lines += ["", "TRADE STATUS : NO ACTIVE XAUUSD TRADE", "Watching completed 1-minute candles for the next valid setup."]
-    total_risk_percent = min(7.0, risk_percent + risk_buffer_percent)
-    daily_budget = (
-        daily_opening_balance
-        * Decimal(str(total_risk_percent))
-        / Decimal("100")
-    )
+    risk_state = daily_risk_state or {}
+    reduced_mode = bool(risk_state.get("reduced_mode", False))
+    active_target = 3.0 if reduced_mode else risk_percent
+    active_buffer = 1.0 if reduced_mode else risk_buffer_percent
+    total_risk_percent = min(7.0, active_target + active_buffer)
+    daily_budget = daily_opening_balance * Decimal(str(total_risk_percent)) / Decimal("100")
+    daily_closed_pnl = dec(risk_state.get("realized_closed_pnl", "0"))
+    mode_label = "REDUCED" if reduced_mode else "NORMAL"
     lines += ["", f"Daily Opening Balance: ${daily_opening_balance:.2f}",
-              f"Risk Budget          : {risk_percent:.2f}% + {risk_buffer_percent:.2f}% buffer = {total_risk_percent:.2f}% (${daily_budget:.2f})", 
+              f"Daily Closed P/L      : ${float(daily_closed_pnl):+.2f}",
+              f"Risk Mode             : {mode_label} ({active_target:.2f}% + {active_buffer:.2f}% = {total_risk_percent:.2f}%)",
+              f"Risk Budget           : ${daily_budget:.2f}", 
               f"New Entries          : {'ON (DEMO LIMIT only)' if os.getenv('TRADING_ENABLED', 'false').strip().lower() in {'1','true','yes','y','on'} else 'OFF'}",
               "=" * 68, ""]
     print("\n".join(lines), flush=True)
@@ -1986,7 +2113,7 @@ def main() -> int:
     logging.info("Account: %s | Market: %s", cfg.account_mode.upper(), cfg.instrument)
     logging.info("Entry method: LIMIT orders only | No market-order fallback")
     logging.info(
-        "Risk per trade: %.2f%% target + %.2f%% buffer = %.2f%% maximum | Reward ratio: %s | Stop manager: %s",
+        "Normal risk: %.2f%% + %.2f%% buffer = %.2f%% maximum | Reduced after 30%% daily closed loss: 3%% + 1%% | Reward ratio: %s | Stop manager: %s",
         cfg.risk_percent, cfg.risk_buffer_percent,
         min(7.0, cfg.risk_percent + cfg.risk_buffer_percent),
         cfg.risk_reward, "ON" if trailing_enabled else "OFF",
@@ -2020,12 +2147,13 @@ def main() -> int:
     orders, positions = instrument_activity(snap, cfg.instrument)
     logging.info("Account check: %d pending order(s) and %d open position(s) found for %s.", len(orders), len(positions), cfg.instrument)
     daily_opening_balance, daily_balance_date = get_daily_opening_balance(store, api, snap)
+    daily_risk_state = get_daily_risk_state(store, daily_opening_balance, daily_balance_date)
+    active_target, active_buffer, active_budget = daily_risk_parameters(cfg, daily_opening_balance, daily_risk_state)
     logging.info(
-        "Today's opening balance (%s IST): $%.2f | Risk target %.2f%% + buffer %.2f%% = maximum $%.2f (%.2f%%).",
-        daily_balance_date, float(daily_opening_balance), cfg.risk_percent,
-        cfg.risk_buffer_percent,
-        float(daily_opening_balance * dec(min(7.0, cfg.risk_percent + cfg.risk_buffer_percent)) / Decimal("100")),
-        min(7.0, cfg.risk_percent + cfg.risk_buffer_percent),
+        "Today's opening balance (%s IST): $%.2f | %s risk %.2f%% + buffer %.2f%% = maximum $%.2f (%.2f%%).",
+        daily_balance_date, float(daily_opening_balance),
+        "REDUCED" if daily_risk_state.get("reduced_mode") else "NORMAL",
+        active_target, active_buffer, float(active_budget), active_target + active_buffer,
     )
     unresolved = pending_submission_blocks(store, snap, cfg.instrument)
     existing_lock = store.get_json("trade_lock", {}) or {}
@@ -2073,6 +2201,8 @@ def main() -> int:
             snap = api.snapshot()
             active_orders, open_positions = instrument_activity(snap, cfg.instrument)
             trade_locked = refresh_trade_lock(store, api, snap, cfg.instrument)
+            daily_opening_balance, daily_balance_date = get_daily_opening_balance(store, api, snap)
+            daily_risk_state = get_daily_risk_state(store, daily_opening_balance, daily_balance_date)
             unresolved = pending_submission_blocks(store, snap, cfg.instrument)
             # Run once per newly completed M1 candle. Pending orders are ignored;
             # only an actually open position with its linked active SLTP order is managed.
@@ -2082,7 +2212,7 @@ def main() -> int:
                 display_trade_dashboard(
                     store, snap, m1, cfg.instrument, cfg.account_mode, cfg.contract_size,
                     daily_opening_balance, cfg.risk_percent, cfg.risk_buffer_percent,
-                    conditions, trailing_enabled,
+                    conditions, trailing_enabled, daily_risk_state,
                 )
             if trade_locked:
                 store.set("last_processed_m1", bar_ts)
@@ -2107,8 +2237,10 @@ def main() -> int:
                 continue
 
             daily_opening_balance, daily_balance_date = get_daily_opening_balance(store, api, snap)
+            daily_risk_state = get_daily_risk_state(store, daily_opening_balance, daily_balance_date)
+            active_target, active_buffer, active_budget = daily_risk_parameters(cfg, daily_opening_balance, daily_risk_state)
             risk_cfg = replace(cfg, account_capital=float(daily_opening_balance))
-            signal, pending = compute_signal(m1, m3, risk_cfg, pending)
+            signal, pending = compute_signal(m1, m3, risk_cfg, pending, active_target, active_buffer)
             store.set_json("breakout_pending", pending)
             # Consume this closed bar before validation/submission so the same
             # signal cannot be replayed on each polling iteration.
@@ -2124,7 +2256,7 @@ def main() -> int:
                 logging.info("Stop Loss   : %s", signal["sl_text"])
                 logging.info("Take Profit : %s", signal["tp_text"])
                 logging.info("Lot size    : %s", signal["volume_text"])
-                logging.info("Planned risk: $%.2f (maximum allowed %.2f%%) | Reward ratio: %s", signal["risk_cash"], min(7.0, cfg.risk_percent + cfg.risk_buffer_percent), cfg.risk_reward)
+                logging.info("Planned risk: $%.2f (maximum allowed %.2f%%; %s mode) | Reward ratio: %s", signal["risk_cash"], active_target + active_buffer, "REDUCED" if daily_risk_state.get("reduced_mode") else "NORMAL", cfg.risk_reward)
                 logging.info("Signal time : %s", signal["bar_time"])
                 logging.info("-" * 58)
                 if cfg.trading_enabled:
