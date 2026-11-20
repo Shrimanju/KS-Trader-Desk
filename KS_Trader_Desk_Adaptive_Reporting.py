@@ -2019,89 +2019,11 @@ class Main(MainContext):
                         pass
 
             # ================================================
-            # ADD-ON ENTRIES 2 TO 5
-            # ================================================
+            # SINGLE-ENTRY RULE:
+            # Add-on entries 2 to 5 are disabled. Once Entry 1 opens,
+            # the strategy waits for the existing SL / TP exit logic to
+            # close the position before another setup can be entered.
 
-            if (
-                side[0] != 0.0
-                and entry_count[0] >= 1.0
-                and entry_count[0] < 5.0
-                and self.bar_index > last_entry_bar[0]
-            ):
-
-                is_buy_side = side[0] == 1.0
-
-                add_ok = False
-
-                if is_buy_side:
-
-                    add_ok = (
-                        candidate_entry_price < last_entry_price[0]
-                        and bullish_price_action
-                        and buy_add_location
-                        and buy_add_score >= 4
-                    )
-
-                else:
-
-                    add_ok = (
-                        candidate_entry_price > last_entry_price[0]
-                        and bearish_price_action
-                        and sell_add_location
-                        and sell_add_score >= 4
-                    )
-
-                if add_ok:
-
-                    new_count = entry_count[0] + 1.0
-
-                    entry_count[0] = new_count
-                    last_entry_bar[0] = float(self.bar_index)
-                    last_entry_price[0] = candidate_entry_price
-
-                    add_name = 'Second'
-                    add_color = color.BLACK
-
-                    if new_count == 2.0:
-                        second_entry_price[0] = candidate_entry_price
-
-                    elif new_count == 3.0:
-                        third_entry_price[0] = candidate_entry_price
-                        add_name = 'Third'
-                        add_color = color.FUCHSIA
-
-                    elif new_count == 4.0:
-                        fourth_entry_price[0] = candidate_entry_price
-                        add_name = 'Fourth'
-                        add_color = color.YELLOW
-
-                    else:
-                        fifth_entry_price[0] = candidate_entry_price
-                        add_name = 'Fifth'
-                        add_color = color.PURPLE
-
-                    add_setup_name = add_name + (
-                        ' BUY' if is_buy_side else ' SELL'
-                    )
-
-                    if not (
-                        self.delete_setup == add_setup_name
-                        and self.bar_index == self.delete_bar_index
-                    ):
-
-                        if is_buy_side:
-
-                            if self.is_closed_bar:
-
-                                pass
-
-                        else:
-
-                            if self.is_closed_bar:
-
-                                pass
-
-            # ================================================
             # ARM NEW BREAKOUT PULLBACK SETUPS
             # ================================================
 
@@ -2310,7 +2232,11 @@ class Main(MainContext):
             # signal candle's opposite extreme. No P/L is booked
             # for a setup that expires without an entry.
             # ------------------------------------------------
-            if pending_trade_side[0] != 0.0:
+            if (
+                pending_trade_side[0] != 0.0
+                and side[0] == 0.0
+                and not trade_exited
+            ):
 
                 pending_setup_was_checked = True
                 pending_midpoint_value = pending_trade_entry[0]
@@ -2401,7 +2327,9 @@ class Main(MainContext):
             # Moderate momentum arms a 50% pullback setup.
             # ------------------------------------------------
             if (
-                pending_trade_side[0] == 0.0
+                side[0] == 0.0
+                and not trade_exited
+                and pending_trade_side[0] == 0.0
                 and not pending_setup_was_checked
             ):
 
@@ -2483,7 +2411,11 @@ class Main(MainContext):
             # Keep the eight-candle structural SL, original
             # protective buffer, 15-point cap and strict lot sizing.
             # ------------------------------------------------
-            if primary_entry_side != 0.0:
+            if (
+                primary_entry_side != 0.0
+                and side[0] == 0.0
+                and not trade_exited
+            ):
 
                 entry_price = self.close[0]
 
