@@ -402,6 +402,7 @@ class Main(MainContext):
         pending_trade_risk_cash = MutSeriesF.new(init=nan)
         pending_trade_setup_day = MutSeriesF.new(init=nan)
         pending_trade_setup_bar = MutSeriesF.new(init=-1.0)
+        pending_trade_pullback_touched = MutSeriesF.new(init=0.0)
 
         entry_label_time = MutSeriesF.new(init=nan)
         early_exit_warned = MutSeriesF.new(init=0.0)
@@ -528,6 +529,7 @@ class Main(MainContext):
             pending_trade_risk_cash[0] = pending_trade_risk_cash[1]
             pending_trade_setup_day[0] = pending_trade_setup_day[1]
             pending_trade_setup_bar[0] = pending_trade_setup_bar[1]
+            pending_trade_pullback_touched[0] = pending_trade_pullback_touched[1]
 
             entry_label_time[0] = entry_label_time[1]
             early_exit_warned[0] = early_exit_warned[1]
@@ -657,6 +659,7 @@ class Main(MainContext):
             pending_trade_risk_cash[0] = nan
             pending_trade_setup_day[0] = nan
             pending_trade_setup_bar[0] = -1.0
+            pending_trade_pullback_touched[0] = 0.0
             entry_label_time[0] = nan
             early_exit_warned[0] = 0.0
             report_trades[0] = 0.0
@@ -1276,6 +1279,39 @@ class Main(MainContext):
         )
 
         # ====================================================
+        # ====================================================
+        # ADAPTIVE PRIMARY-ENTRY MOMENTUM CLASSIFICATION
+        # 4/5 confirmations = strong momentum (close entry).
+        # Otherwise = moderate momentum (wait for 50% pullback).
+        # ====================================================
+
+        buy_momentum_score = 0
+        if bullish_trend:
+            buy_momentum_score += 1
+        if htf_buy:
+            buy_momentum_score += 1
+        if rsi[0] > 50 and rsi[0] > rsi[1]:
+            buy_momentum_score += 1
+        if bullish_strong_body or bullish_close_momentum:
+            buy_momentum_score += 1
+        if buy_volume_confirm:
+            buy_momentum_score += 1
+
+        sell_momentum_score = 0
+        if bearish_trend:
+            sell_momentum_score += 1
+        if htf_sell:
+            sell_momentum_score += 1
+        if rsi[0] < 50 and rsi[0] < rsi[1]:
+            sell_momentum_score += 1
+        if bearish_strong_body or bearish_close_momentum:
+            sell_momentum_score += 1
+        if sell_volume_confirm:
+            sell_momentum_score += 1
+
+        strong_buy_momentum = buy_momentum_score >= 4
+        strong_sell_momentum = sell_momentum_score >= 4
+
         # ADD-ON ENTRY SCORES
         # ====================================================
 
@@ -1473,92 +1509,7 @@ class Main(MainContext):
         report_hit_tp = False
         report_hit_trailing_sl = False
 
-        # Resolve pending setups before managing active-trade exits. The
-        # confirmation candle is deliberately excluded: its midpoint is
-        # inside its own range and must not self-trigger the pending entry.
-        if (
-            self.is_closed_bar
-            and pending_trade_side[0] != 0.0
-            and self.bar_index > pending_trade_setup_bar[0]
-        ):
-            pending_side_value = pending_trade_side[0]
-            pending_entry_value = pending_trade_entry[0]
-            pending_sl_value = pending_trade_sl[0]
-            pending_tp_value = pending_trade_tp[0]
-
-            # Declare touch flags in the enclosing scope. Indie scopes variables
-            # declared inside an if/else block to that indentation block.
-            pending_entry_touched = False
-            pending_sl_touched = False
-            pending_tp_touched = False
-
-            if pending_side_value == 1.0:
-                pending_entry_touched = self.low[0] <= pending_entry_value
-                pending_sl_touched = self.low[0] <= pending_sl_value
-                pending_tp_touched = self.high[0] >= pending_tp_value
-            else:
-                pending_entry_touched = self.high[0] >= pending_entry_value
-                pending_sl_touched = self.high[0] >= pending_sl_value
-                pending_tp_touched = self.low[0] <= pending_tp_value
-
-            pending_exit_touched = pending_sl_touched or pending_tp_touched
-            if pending_exit_touched:
-                # Conservative rule: if entry and pre-entry SL/TP are touched
-                # in the same candle, the order is Inactive, never a trade.
-                if pending_trade_setup_day[0] == self._selected_report_day_key:
-                    report_inactive_trades[0] = report_inactive_trades[0] + 1.0
-                    report_trades[0] = report_active_trades[0] + report_inactive_trades[0]
-
-                    # Hypothetical inactive-order P/L: deliberately ignore whether
-                    # the planned entry was reached. Use the original planned
-                    # entry/SL/TP and conservative SL-first same-candle handling.
-                    inactive_exit_price = pending_sl_value if pending_sl_touched else pending_tp_value
-                    inactive_result = (
-                        (inactive_exit_price - pending_entry_value)
-                        * pending_side_value
-                        * self.contract_size
-                        * pending_trade_lot[0]
-                    )
-                    report_inactive_pnl[0] = report_inactive_pnl[0] + inactive_result
-                pending_trade_side[0] = 0.0
-                pending_trade_entry[0] = nan
-                pending_trade_sl[0] = nan
-                pending_trade_tp[0] = nan
-                pending_trade_lot[0] = nan
-                pending_trade_risk_cash[0] = nan
-                pending_trade_setup_day[0] = nan
-                pending_trade_setup_bar[0] = -1.0
-            elif pending_entry_touched:
-                entry[0] = pending_entry_value
-                sl[0] = pending_sl_value
-                tp[0] = pending_tp_value
-                side[0] = pending_side_value
-                trade_lot[0] = pending_trade_lot[0]
-                trade_risk_cash[0] = pending_trade_risk_cash[0]
-                original_risk_distance[0] = abs(pending_entry_value - pending_sl_value)
-                favorable_extreme[0] = pending_entry_value
-                trail_candidate[0] = nan
-                trail_confirm_count[0] = 0.0
-                trail_stage[0] = 0.0
-                trail_last_update_bar[0] = -1.0
-                early_exit_warned[0] = 0.0
-                entry_count[0] = 1.0
-                last_entry_bar[0] = float(self.bar_index)
-                last_entry_price[0] = pending_entry_value
-                entry_label_time[0] = self.time[0]
-                if pending_trade_setup_day[0] == self._selected_report_day_key:
-                    report_active_trades[0] = report_active_trades[0] + 1.0
-                    report_trades[0] = report_active_trades[0] + report_inactive_trades[0]
-                pending_trade_side[0] = 0.0
-                pending_trade_entry[0] = nan
-                pending_trade_sl[0] = nan
-                pending_trade_tp[0] = nan
-                pending_trade_lot[0] = nan
-                pending_trade_risk_cash[0] = nan
-                pending_trade_setup_day[0] = nan
-                pending_trade_setup_bar[0] = -1.0
-
-        if self.is_closed_bar:
+if self.is_closed_bar:
 
             pass
 
@@ -2300,109 +2251,225 @@ class Main(MainContext):
                     sell_breakout_entry_price = pending_sell_high[0]
 
             # ================================================
-            # NEW PRIMARY ENTRY
+            # ================================================
+            # ADAPTIVE PRIMARY ENTRY
+            # STRONG = CONFIRMATION-CLOSE ENTRY
+            # MODERATE = 50% PULLBACK + REJECTION-CLOSE ENTRY
             # ================================================
 
-            # Never commit an entry, set active trade state, or expose an
-            # absolute entry marker while this candle is still forming.
-            # Setup conditions may develop intrabar, but the final entry/SL/TP
-            # calculation is committed only on the candle-close callback.
+            primary_entry_side = 0.0
+            primary_entry_from_pullback = False
+            pending_setup_was_checked = False
+            pending_setup_expired = False
+            pending_setup_invalidated = False
+            pending_pullback_confirmed = False
+            pending_midpoint_value = nan
+            pending_signal_extreme = nan
+            pending_setup_age = 0.0
+
+            sell_entry_ready = False
+            buy_entry_ready = False
+
+            recent_high = nan
+            recent_low = nan
+            entry_price = nan
+            stop_price = nan
+            risk = nan
+            sl_distance = nan
+            risk_per_one_lot = nan
+            calculated_lot = 0.0
+            calculated_risk_cash = nan
+            target_price = nan
+            entry_stop_buffer = nan
+
+            # ------------------------------------------------
+            # A) Resolve an existing moderate-momentum setup.
+            # A midpoint touch is remembered; entry needs a later
+            # directional rejection candle closing back through it.
+            # Setups expire after 10 bars or a close beyond the
+            # signal candle's opposite extreme. No P/L is booked
+            # for a setup that expires without an entry.
+            # ------------------------------------------------
+            if pending_trade_side[0] != 0.0:
+
+                pending_setup_was_checked = True
+                pending_midpoint_value = pending_trade_entry[0]
+                pending_signal_extreme = pending_trade_sl[0]
+                pending_setup_age = (
+                    self.bar_index - pending_trade_setup_bar[0]
+                )
+
+                if pending_setup_age > 10.0:
+                    pending_setup_expired = True
+
+                if pending_trade_side[0] == 1.0:
+
+                    if self.close[0] < pending_signal_extreme:
+                        pending_setup_invalidated = True
+
+                    if self.low[0] <= pending_midpoint_value:
+                        pending_trade_pullback_touched[0] = 1.0
+
+                    pending_pullback_confirmed = (
+                        pending_trade_pullback_touched[0] == 1.0
+                        and self.close[0] > pending_midpoint_value
+                        and self.close[0] > self.open[0]
+                        and (
+                            bullish_rejection
+                            or bullish_engulfing
+                            or bullish_hammer
+                            or bullish_close_momentum
+                        )
+                    )
+
+                    if (
+                        not pending_setup_expired
+                        and not pending_setup_invalidated
+                        and pending_pullback_confirmed
+                    ):
+                        primary_entry_side = 1.0
+                        primary_entry_from_pullback = True
+                        buy_signal = True
+                        buy_reason = '50% PULLBACK + REJECTION'
+
+                else:
+
+                    if self.close[0] > pending_signal_extreme:
+                        pending_setup_invalidated = True
+
+                    if self.high[0] >= pending_midpoint_value:
+                        pending_trade_pullback_touched[0] = 1.0
+
+                    pending_pullback_confirmed = (
+                        pending_trade_pullback_touched[0] == 1.0
+                        and self.close[0] < pending_midpoint_value
+                        and self.close[0] < self.open[0]
+                        and (
+                            bearish_rejection
+                            or bearish_engulfing
+                            or bearish_shooting_star
+                            or bearish_close_momentum
+                        )
+                    )
+
+                    if (
+                        not pending_setup_expired
+                        and not pending_setup_invalidated
+                        and pending_pullback_confirmed
+                    ):
+                        primary_entry_side = -1.0
+                        primary_entry_from_pullback = True
+                        sell_signal = True
+                        sell_reason = '50% PULLBACK + REJECTION'
+
+                if (
+                    pending_setup_expired
+                    or pending_setup_invalidated
+                    or primary_entry_side != 0.0
+                ):
+                    pending_trade_side[0] = 0.0
+                    pending_trade_entry[0] = nan
+                    pending_trade_sl[0] = nan
+                    pending_trade_tp[0] = nan
+                    pending_trade_lot[0] = nan
+                    pending_trade_risk_cash[0] = nan
+                    pending_trade_setup_day[0] = nan
+                    pending_trade_setup_bar[0] = -1.0
+                    pending_trade_pullback_touched[0] = 0.0
+
+            # ------------------------------------------------
+            # B) With no setup waiting, evaluate a fresh signal.
+            # Strong momentum enters at this confirmation close.
+            # Moderate momentum arms a 50% pullback setup.
+            # ------------------------------------------------
             if (
-                self.is_closed_bar and side[0] == 0.0
-                and pending_trade_side[0] == 0.0 and not trade_exited
+                pending_trade_side[0] == 0.0
+                and not pending_setup_was_checked
             ):
 
-                # Preserve the original signal conditions without a deviation
-                # filter. Entry 1 uses the confirmation candle midpoint.
-                sell_entry_ready = sell_condition or sell_breakout_pullback_ready
-                buy_entry_ready = buy_condition or buy_breakout_pullback_ready
+                sell_entry_ready = (
+                    sell_condition or sell_breakout_pullback_ready
+                )
+                buy_entry_ready = (
+                    buy_condition or buy_breakout_pullback_ready
+                )
 
                 if sell_entry_ready and not buy_entry_ready:
 
-                    recent_high = max([
-                        self.high[0], self.high[1],
-                        self.high[2], self.high[3],
-                        self.high[4], self.high[5],
-                        self.high[6], self.high[7]
-                    ])
-
-                    # Original Entry 1 logic: confirmation candle midpoint.
-                    entry_price = candidate_entry_price
+                    sell_signal = True
 
                     if sell_breakout_pullback_ready:
                         sell_reason = 'BREAKOUT + VOLUME PULLBACK'
 
-                    stop_price = recent_high
+                    if strong_sell_momentum:
 
-                    entry_stop_buffer = max(
-                        candle_range * 0.25,
-                        abs(entry_price) * 0.00005
-                    )
+                        primary_entry_side = -1.0
 
-                    stop_price = max(
-                        stop_price,
-                        entry_price + entry_stop_buffer
-                    )
+                    else:
 
-                    risk = stop_price - entry_price
-                    sl_distance = abs(entry_price - stop_price)
-                    risk_per_one_lot = sl_distance * self.contract_size
-                    calculated_lot = 0.0
-                    calculated_risk_cash = nan
-
-                    if risk_per_one_lot > 0.0 and risk_budget_cash > 0.0:
-                        raw_lot = risk_budget_cash / risk_per_one_lot
-                        calculated_lot = int(raw_lot * 100.0) / 100.0
-                        calculated_risk_cash = (
-                            calculated_lot * risk_per_one_lot
-                        )
-
-                    if (
-                        risk > 0.0
-                        and sl_distance <= maximum_allowed_sl_distance
-                        and calculated_lot >= 0.01
-                    ):
-
-                        target_price = entry_price - risk * rr_multiplier
-
-                        # Save the planned trade as pending. It becomes active
-                        # only when a later completed candle reaches entry.
                         pending_trade_side[0] = -1.0
-                        pending_trade_entry[0] = entry_price
-                        pending_trade_sl[0] = stop_price
-                        pending_trade_tp[0] = target_price
-                        pending_trade_lot[0] = calculated_lot
-                        pending_trade_risk_cash[0] = calculated_risk_cash
+                        pending_trade_entry[0] = candidate_entry_price
+                        pending_trade_sl[0] = self.high[0]
+                        pending_trade_tp[0] = nan
+                        pending_trade_lot[0] = nan
+                        pending_trade_risk_cash[0] = nan
                         pending_trade_setup_day[0] = current_ist_day_key
                         pending_trade_setup_bar[0] = float(self.bar_index)
+                        pending_trade_pullback_touched[0] = 0.0
 
-                        second_entry_price[0] = nan
-                        third_entry_price[0] = nan
-                        fourth_entry_price[0] = nan
-                        fifth_entry_price[0] = nan
+                    pending_buy[0] = 0.0
+                    pending_buy_average[0] = nan
+                    pending_buy_low[0] = nan
+                    pending_buy_bar[0] = -1.0
 
-                        sell_signal = True
-
-                        pending_buy[0] = 0.0
-                        pending_buy_average[0] = nan
-                        pending_buy_low[0] = nan
-                        pending_buy_bar[0] = -1.0
-
-                        pending_sell[0] = 0.0
-                        pending_sell_average[0] = nan
-                        pending_sell_high[0] = nan
-                        pending_sell_bar[0] = -1.0
-
-                        if not (
-                            self.delete_setup == 'Primary SELL'
-                            and self.bar_index == self.delete_bar_index
-                        ):
-
-                            if self.is_closed_bar:
-
-                                pass
+                    pending_sell[0] = 0.0
+                    pending_sell_average[0] = nan
+                    pending_sell_high[0] = nan
+                    pending_sell_bar[0] = -1.0
 
                 elif buy_entry_ready:
+
+                    buy_signal = True
+
+                    if buy_breakout_pullback_ready:
+                        buy_reason = 'BREAKOUT + VOLUME PULLBACK'
+
+                    if strong_buy_momentum:
+
+                        primary_entry_side = 1.0
+
+                    else:
+
+                        pending_trade_side[0] = 1.0
+                        pending_trade_entry[0] = candidate_entry_price
+                        pending_trade_sl[0] = self.low[0]
+                        pending_trade_tp[0] = nan
+                        pending_trade_lot[0] = nan
+                        pending_trade_risk_cash[0] = nan
+                        pending_trade_setup_day[0] = current_ist_day_key
+                        pending_trade_setup_bar[0] = float(self.bar_index)
+                        pending_trade_pullback_touched[0] = 0.0
+
+                    pending_buy[0] = 0.0
+                    pending_buy_average[0] = nan
+                    pending_buy_low[0] = nan
+                    pending_buy_bar[0] = -1.0
+
+                    pending_sell[0] = 0.0
+                    pending_sell_average[0] = nan
+                    pending_sell_high[0] = nan
+                    pending_sell_bar[0] = -1.0
+
+            # ------------------------------------------------
+            # C) Execute a qualified entry at the actual close.
+            # Keep the eight-candle structural SL, original
+            # protective buffer, 15-point cap and strict lot sizing.
+            # ------------------------------------------------
+            if primary_entry_side != 0.0:
+
+                entry_price = self.close[0]
+
+                if primary_entry_side == 1.0:
 
                     recent_low = min([
                         self.low[0], self.low[1],
@@ -2411,83 +2478,89 @@ class Main(MainContext):
                         self.low[6], self.low[7]
                     ])
 
-                    # Original Entry 1 logic: confirmation candle midpoint.
-                    entry_price = candidate_entry_price
-
-                    if buy_breakout_pullback_ready:
-                        buy_reason = 'BREAKOUT + VOLUME PULLBACK'
-
                     stop_price = recent_low
-
                     entry_stop_buffer = max(
                         candle_range * 0.25,
                         abs(entry_price) * 0.00005
                     )
-
                     stop_price = min(
                         stop_price,
                         entry_price - entry_stop_buffer
                     )
-
                     risk = entry_price - stop_price
-                    sl_distance = abs(entry_price - stop_price)
-                    risk_per_one_lot = sl_distance * self.contract_size
-                    calculated_lot = 0.0
-                    calculated_risk_cash = nan
 
-                    if risk_per_one_lot > 0.0 and risk_budget_cash > 0.0:
-                        raw_lot = risk_budget_cash / risk_per_one_lot
-                        calculated_lot = int(raw_lot * 100.0) / 100.0
-                        calculated_risk_cash = (
-                            calculated_lot * risk_per_one_lot
+                else:
+
+                    recent_high = max([
+                        self.high[0], self.high[1],
+                        self.high[2], self.high[3],
+                        self.high[4], self.high[5],
+                        self.high[6], self.high[7]
+                    ])
+
+                    stop_price = recent_high
+                    entry_stop_buffer = max(
+                        candle_range * 0.25,
+                        abs(entry_price) * 0.00005
+                    )
+                    stop_price = max(
+                        stop_price,
+                        entry_price + entry_stop_buffer
+                    )
+                    risk = stop_price - entry_price
+
+                sl_distance = abs(entry_price - stop_price)
+                risk_per_one_lot = sl_distance * self.contract_size
+                calculated_lot = 0.0
+                calculated_risk_cash = nan
+
+                if risk_per_one_lot > 0.0 and risk_budget_cash > 0.0:
+                    raw_lot = risk_budget_cash / risk_per_one_lot
+                    calculated_lot = int(raw_lot * 100.0) / 100.0
+                    calculated_risk_cash = (
+                        calculated_lot * risk_per_one_lot
+                    )
+
+                if (
+                    risk > 0.0
+                    and sl_distance <= maximum_allowed_sl_distance
+                    and calculated_lot >= 0.01
+                ):
+
+                    if primary_entry_side == 1.0:
+                        target_price = entry_price + risk * rr_multiplier
+                    else:
+                        target_price = entry_price - risk * rr_multiplier
+
+                    entry[0] = entry_price
+                    sl[0] = stop_price
+                    tp[0] = target_price
+                    side[0] = primary_entry_side
+                    trade_lot[0] = calculated_lot
+                    trade_risk_cash[0] = calculated_risk_cash
+                    original_risk_distance[0] = sl_distance
+                    favorable_extreme[0] = entry_price
+                    trail_candidate[0] = nan
+                    trail_confirm_count[0] = 0.0
+                    trail_stage[0] = 0.0
+                    trail_last_update_bar[0] = -1.0
+                    early_exit_warned[0] = 0.0
+                    entry_count[0] = 1.0
+                    last_entry_bar[0] = float(self.bar_index)
+                    last_entry_price[0] = entry_price
+                    entry_label_time[0] = self.time[0]
+
+                    second_entry_price[0] = nan
+                    third_entry_price[0] = nan
+                    fourth_entry_price[0] = nan
+                    fifth_entry_price[0] = nan
+
+                    if current_ist_day_key == self._selected_report_day_key:
+                        report_active_trades[0] = report_active_trades[0] + 1.0
+                        report_trades[0] = (
+                            report_active_trades[0] + report_inactive_trades[0]
                         )
 
-                    if (
-                        risk > 0.0
-                        and sl_distance <= maximum_allowed_sl_distance
-                        and calculated_lot >= 0.01
-                    ):
-
-                        target_price = entry_price + risk * rr_multiplier
-
-                        # Save the planned trade as pending. It becomes active
-                        # only when a later completed candle reaches entry.
-                        pending_trade_side[0] = 1.0
-                        pending_trade_entry[0] = entry_price
-                        pending_trade_sl[0] = stop_price
-                        pending_trade_tp[0] = target_price
-                        pending_trade_lot[0] = calculated_lot
-                        pending_trade_risk_cash[0] = calculated_risk_cash
-                        pending_trade_setup_day[0] = current_ist_day_key
-                        pending_trade_setup_bar[0] = float(self.bar_index)
-
-                        second_entry_price[0] = nan
-                        third_entry_price[0] = nan
-                        fourth_entry_price[0] = nan
-                        fifth_entry_price[0] = nan
-
-                        buy_signal = True
-
-                        pending_buy[0] = 0.0
-                        pending_buy_average[0] = nan
-                        pending_buy_low[0] = nan
-                        pending_buy_bar[0] = -1.0
-
-                        pending_sell[0] = 0.0
-                        pending_sell_average[0] = nan
-                        pending_sell_high[0] = nan
-                        pending_sell_bar[0] = -1.0
-
-                        if not (
-                            self.delete_setup == 'Primary BUY'
-                            and self.bar_index == self.delete_bar_index
-                        ):
-
-                            if self.is_closed_bar:
-
-                                pass
-
-        # ====================================================
         # ONE COMBINED TRADE DESCRIPTION BOX
         # ====================================================
 
@@ -2724,7 +2797,7 @@ class Main(MainContext):
             trailing_sl_count = int(report_trailing_sl[0])
             active_trades = int(report_active_trades[0])
             inactive_trades = int(report_inactive_trades[0])
-            total_trades = active_trades + inactive_trades
+            total_trades = active_trades
             total_exits = sl_count + tp_count + trailing_sl_count
 
             win_rate = 0.0
@@ -2777,10 +2850,6 @@ class Main(MainContext):
                 '| ' + 'Active Trades'.ljust(label_width) + ' | '
                 + str(active_trades).ljust(value_width) + ' |'
             )
-            inactive_row = (
-                '| ' + 'Inactive Trades'.ljust(label_width) + ' | '
-                + str(inactive_trades).ljust(value_width) + ' |'
-            )
             total_row = (
                 '| ' + 'Total trades'.ljust(label_width) + ' | '
                 + str(total_trades).ljust(value_width) + ' |'
@@ -2789,10 +2858,6 @@ class Main(MainContext):
             active_pnl_row = (
                 '| ' + 'Active Trade P/L'.ljust(label_width) + ' | '
                 + ('$' + str(round(report_active_pnl[0], 2))).ljust(value_width) + ' |'
-            )
-            inactive_pnl_row = (
-                '| ' + 'Inactive Trade P/L'.ljust(label_width) + ' | '
-                + ('$' + str(round(report_inactive_pnl[0], 2))).ljust(value_width) + ' |'
             )
 
             sl_row = (
@@ -2840,10 +2905,8 @@ class Main(MainContext):
                 + date_row + '\n'
                 + timeframe_row + '\n'
                 + active_row + '\n'
-                + inactive_row + '\n'
                 + total_row + '\n'
                 + active_pnl_row + '\n'
-                + inactive_pnl_row + '\n'
                 + sl_row + '\n'
                 + tp_row + '\n'
                 + trailing_sl_row + '\n'
