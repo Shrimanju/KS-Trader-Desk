@@ -392,8 +392,8 @@ class Main(MainContext):
         last_entry_bar = MutSeriesF.new(init=-1.0)
         last_entry_price = MutSeriesF.new(init=nan)
 
-        # Pending Entry 1 lifecycle. A setup is not active until a later
-        # completed candle reaches its planned midpoint entry.
+        # Pending state is used only for moderate-momentum setups waiting
+        # for a 50% pullback touch and a confirmed rejection close.
         pending_trade_side = MutSeriesF.new(init=0.0)
         pending_trade_entry = MutSeriesF.new(init=nan)
         pending_trade_sl = MutSeriesF.new(init=nan)
@@ -2261,7 +2261,6 @@ if self.is_closed_bar:
             # ================================================
 
             primary_entry_side = 0.0
-            primary_entry_from_pullback = False
             pending_setup_was_checked = False
             pending_setup_expired = False
             pending_setup_invalidated = False
@@ -2331,7 +2330,6 @@ if self.is_closed_bar:
                         and pending_pullback_confirmed
                     ):
                         primary_entry_side = 1.0
-                        primary_entry_from_pullback = True
                         buy_signal = True
                         buy_reason = '50% PULLBACK + REJECTION'
 
@@ -2361,7 +2359,6 @@ if self.is_closed_bar:
                         and pending_pullback_confirmed
                     ):
                         primary_entry_side = -1.0
-                        primary_entry_from_pullback = True
                         sell_signal = True
                         sell_reason = '50% PULLBACK + REJECTION'
 
