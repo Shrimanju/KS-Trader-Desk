@@ -407,11 +407,14 @@ class Main(MainContext):
         entry_label_time = MutSeriesF.new(init=nan)
         early_exit_warned = MutSeriesF.new(init=0.0)
 
-        report_trades = MutSeriesF.new(init=0.0)
+        # Report actual simulated entries, closes and realized outcomes only.
         report_active_trades = MutSeriesF.new(init=0.0)
-        report_inactive_trades = MutSeriesF.new(init=0.0)
+        report_open_trades = MutSeriesF.new(init=0.0)
+        report_manual_exits = MutSeriesF.new(init=0.0)
+        report_wins = MutSeriesF.new(init=0.0)
+        report_losses = MutSeriesF.new(init=0.0)
+        report_breakeven = MutSeriesF.new(init=0.0)
         report_active_pnl = MutSeriesF.new(init=0.0)
-        report_inactive_pnl = MutSeriesF.new(init=0.0)
         report_sl = MutSeriesF.new(init=0.0)
         report_tp = MutSeriesF.new(init=0.0)
         report_trailing_sl = MutSeriesF.new(init=0.0)
@@ -534,11 +537,13 @@ class Main(MainContext):
             entry_label_time[0] = entry_label_time[1]
             early_exit_warned[0] = early_exit_warned[1]
 
-            report_trades[0] = report_trades[1]
             report_active_trades[0] = report_active_trades[1]
-            report_inactive_trades[0] = report_inactive_trades[1]
+            report_open_trades[0] = report_open_trades[1]
+            report_manual_exits[0] = report_manual_exits[1]
+            report_wins[0] = report_wins[1]
+            report_losses[0] = report_losses[1]
+            report_breakeven[0] = report_breakeven[1]
             report_active_pnl[0] = report_active_pnl[1]
-            report_inactive_pnl[0] = report_inactive_pnl[1]
             report_sl[0] = report_sl[1]
             report_tp[0] = report_tp[1]
             report_trailing_sl[0] = report_trailing_sl[1]
@@ -662,11 +667,13 @@ class Main(MainContext):
             pending_trade_pullback_touched[0] = 0.0
             entry_label_time[0] = nan
             early_exit_warned[0] = 0.0
-            report_trades[0] = 0.0
             report_active_trades[0] = 0.0
-            report_inactive_trades[0] = 0.0
+            report_open_trades[0] = 0.0
+            report_manual_exits[0] = 0.0
+            report_wins[0] = 0.0
+            report_losses[0] = 0.0
+            report_breakeven[0] = 0.0
             report_active_pnl[0] = 0.0
-            report_inactive_pnl[0] = 0.0
             report_sl[0] = 0.0
             report_tp[0] = 0.0
             report_trailing_sl[0] = 0.0
@@ -1508,12 +1515,11 @@ class Main(MainContext):
         report_hit_tp = False
         report_hit_trailing_sl = False
 
-if self.is_closed_bar:
+        if self.is_closed_bar:
 
             pass
 
             # ================================================
-            # EXITS
             # ================================================
 
             exit_now = False
@@ -1613,6 +1619,13 @@ if self.is_closed_bar:
                         report_net_profit[0] = report_net_profit[0] + realized_pnl
                         report_active_pnl[0] = report_active_pnl[0] + realized_pnl
 
+                        if realized_pnl > 0.0:
+                            report_wins[0] = report_wins[0] + 1.0
+                        elif realized_pnl < 0.0:
+                            report_losses[0] = report_losses[0] + 1.0
+                        else:
+                            report_breakeven[0] = report_breakeven[0] + 1.0
+
                     if (
                         current_ist_day_key >= self._selected_report_month_start_key
                         and current_ist_day_key < self._selected_report_month_end_key
@@ -1682,6 +1695,14 @@ if self.is_closed_bar:
                         monthly_day_30_profit[0] = monthly_day_30_profit[0] + realized_pnl
                     elif current_ist_day_key == self._selected_report_month_start_key + 30.0:
                         monthly_day_31_profit[0] = monthly_day_31_profit[0] + realized_pnl
+
+                if not (report_hit_sl or report_hit_tp):
+                    if (
+                        current_ist_day_key == self._selected_report_day_key
+                        and self.manual_exit_bar_index >= 0
+                        and self.bar_index == self.manual_exit_bar_index
+                    ):
+                        report_manual_exits[0] = report_manual_exits[0] + 1.0
 
                 entry[0] = nan
                 second_entry_price[0] = nan
@@ -2561,9 +2582,6 @@ if self.is_closed_bar:
 
                     if current_ist_day_key == self._selected_report_day_key:
                         report_active_trades[0] = report_active_trades[0] + 1.0
-                        report_trades[0] = (
-                            report_active_trades[0] + report_inactive_trades[0]
-                        )
 
         # ONE COMBINED TRADE DESCRIPTION BOX
         # ====================================================
@@ -2779,6 +2797,12 @@ if self.is_closed_bar:
         # CLOSED TRADES ONLY - SPREADSHEET STYLE
         # ====================================================
 
+        if current_ist_day_key == self._selected_report_day_key:
+            if side[0] != 0.0:
+                report_open_trades[0] = 1.0
+            else:
+                report_open_trades[0] = 0.0
+
         if self.show_daily_report and self.is_last_bar:
 
             chart_minutes = self.time_frame.to_minutes()
@@ -2800,13 +2824,22 @@ if self.is_closed_bar:
             tp_count = int(report_tp[0])
             trailing_sl_count = int(report_trailing_sl[0])
             active_trades = int(report_active_trades[0])
-            inactive_trades = int(report_inactive_trades[0])
-            total_trades = active_trades
-            total_exits = sl_count + tp_count + trailing_sl_count
+            open_trades = int(report_open_trades[0])
+            manual_exit_count = int(report_manual_exits[0])
+            win_count = int(report_wins[0])
+            loss_count = int(report_losses[0])
+            breakeven_count = int(report_breakeven[0])
+
+            # Closed trades includes manual exits, but manual exits are
+            # excluded from realized P/L and win-rate calculations.
+            pnl_closed_trades = win_count + loss_count + breakeven_count
+            closed_trades = (
+                sl_count + tp_count + trailing_sl_count + manual_exit_count
+            )
 
             win_rate = 0.0
-            if total_exits > 0:
-                win_rate = (tp_count / total_exits) * 100.0
+            if pnl_closed_trades > 0:
+                win_rate = (win_count / pnl_closed_trades) * 100.0
 
             report_year = int(self.report_date / 10000)
             report_month = int((self.report_date % 10000) / 100)
@@ -2851,17 +2884,259 @@ if self.is_closed_bar:
             )
 
             active_row = (
-                '| ' + 'Active Trades'.ljust(label_width) + ' | '
+                '| ' + 'Trades Entered'.ljust(label_width) + ' | '
                 + str(active_trades).ljust(value_width) + ' |'
             )
-            total_row = (
-                '| ' + 'Total trades'.ljust(label_width) + ' | '
-                + str(total_trades).ljust(value_width) + ' |'
+            closed_row = (
+                '| ' + 'Closed Trades'.ljust(label_width) + ' | '
+                + str(closed_trades).ljust(value_width) + ' |'
+            )
+            open_row = (
+                '| ' + 'Open Trades at Day End'.ljust(label_width) + ' | '
+                + str(open_trades).ljust(value_width) + ' |'
+            )
+            manual_exit_row = (
+                '| ' + 'Manual Exits (P/L Excluded)'.ljust(label_width) + ' | '
+                + str(manual_exit_count).ljust(value_width) + ' |'
             )
 
             active_pnl_row = (
-                '| ' + 'Active Trade P/L'.ljust(label_width) + ' | '
-                + ('$' + str(round(report_active_pnl[0], 2))).ljust(value_width) + ' |'
+                '| ' + 'Realized Trade P/L'.ljust(label_width) + ' | '
+                + ('
+                '| ' + 'StopLoss'.ljust(label_width) + ' | '
+                + str(sl_count).ljust(value_width) + ' |'
+            )
+
+            tp_row = (
+                '| ' + 'Target Hit'.ljust(label_width) + ' | '
+                + str(tp_count).ljust(value_width) + ' |'
+            )
+
+            trailing_sl_text = (
+                str(trailing_sl_count) if trailing_sl_count > 0
+                else 'No trades hit'
+            )
+            trailing_sl_row = (
+                '| ' + 'Trailing SL Hit'.ljust(label_width) + ' | '
+                + trailing_sl_text.ljust(value_width) + ' |'
+            )
+            win_row = (
+                '| ' + 'Win Rate'.ljust(label_width) + ' | '
+                + (str(int(round(win_rate))) + '%').ljust(value_width) + ' |'
+            )
+
+            rr_row = (
+                '| ' + 'Risk Reward'.ljust(label_width) + ' | '
+                + self.risk_reward.ljust(value_width) + ' |'
+            )
+
+            monthly_net_profit_row = (
+                '| ' + 'Monthly Net P/L'.ljust(label_width) + ' | '
+                + ('$' + str(round(monthly_net_profit[0], 2))).ljust(value_width) + ' |'
+            )
+
+            report_text = (
+                top_border + '\n'
+                + header_row + '\n'
+                + top_border + '\n'
+                + date_row + '\n'
+                + timeframe_row + '\n'
+                + active_row + '\n'
+                + closed_row + '\n'
+                + open_row + '\n'
+                + manual_exit_row + '\n'
+                + active_pnl_row + '\n'
+                + wins_row + '\n'
+                + losses_row + '\n'
+                + breakeven_row + '\n'
+                + sl_row + '\n'
+                + tp_row + '\n'
+                + trailing_sl_row + '\n'
+                + win_row + '\n'
+                + rr_row + '\n'
+                + monthly_net_profit_row
+            )
+
+            # Optional daily breakdown for the selected month, through the current IST date.
+            if self.show_monthly_daily_breakdown:
+                report_text += '\n' + top_border
+                report_text += '\n| ' + 'MONTHLY DAILY NET P/L'.ljust(label_width) + ' | ' + 'AMOUNT'.ljust(value_width) + ' |'
+                report_text += '\n' + top_border
+
+                days_in_selected_month = int(
+                    self._selected_report_month_end_key
+                    - self._selected_report_month_start_key
+                )
+                current_month_day_limit = int(
+                    max(
+                        0.0,
+                        min(
+                            float(days_in_selected_month),
+                            current_ist_day_key - self._selected_report_month_start_key + 1.0
+                        )
+                    )
+                )
+
+                month_names = [
+                    '', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+                ]
+                selected_month_name = month_names[report_month]
+
+                for day_number in range(1, current_month_day_limit + 1):
+                    day_profit = 0.0
+
+                    if day_number == 1:
+                        day_profit = monthly_day_01_profit[0]
+                    elif day_number == 2:
+                        day_profit = monthly_day_02_profit[0]
+                    elif day_number == 3:
+                        day_profit = monthly_day_03_profit[0]
+                    elif day_number == 4:
+                        day_profit = monthly_day_04_profit[0]
+                    elif day_number == 5:
+                        day_profit = monthly_day_05_profit[0]
+                    elif day_number == 6:
+                        day_profit = monthly_day_06_profit[0]
+                    elif day_number == 7:
+                        day_profit = monthly_day_07_profit[0]
+                    elif day_number == 8:
+                        day_profit = monthly_day_08_profit[0]
+                    elif day_number == 9:
+                        day_profit = monthly_day_09_profit[0]
+                    elif day_number == 10:
+                        day_profit = monthly_day_10_profit[0]
+                    elif day_number == 11:
+                        day_profit = monthly_day_11_profit[0]
+                    elif day_number == 12:
+                        day_profit = monthly_day_12_profit[0]
+                    elif day_number == 13:
+                        day_profit = monthly_day_13_profit[0]
+                    elif day_number == 14:
+                        day_profit = monthly_day_14_profit[0]
+                    elif day_number == 15:
+                        day_profit = monthly_day_15_profit[0]
+                    elif day_number == 16:
+                        day_profit = monthly_day_16_profit[0]
+                    elif day_number == 17:
+                        day_profit = monthly_day_17_profit[0]
+                    elif day_number == 18:
+                        day_profit = monthly_day_18_profit[0]
+                    elif day_number == 19:
+                        day_profit = monthly_day_19_profit[0]
+                    elif day_number == 20:
+                        day_profit = monthly_day_20_profit[0]
+                    elif day_number == 21:
+                        day_profit = monthly_day_21_profit[0]
+                    elif day_number == 22:
+                        day_profit = monthly_day_22_profit[0]
+                    elif day_number == 23:
+                        day_profit = monthly_day_23_profit[0]
+                    elif day_number == 24:
+                        day_profit = monthly_day_24_profit[0]
+                    elif day_number == 25:
+                        day_profit = monthly_day_25_profit[0]
+                    elif day_number == 26:
+                        day_profit = monthly_day_26_profit[0]
+                    elif day_number == 27:
+                        day_profit = monthly_day_27_profit[0]
+                    elif day_number == 28:
+                        day_profit = monthly_day_28_profit[0]
+                    elif day_number == 29:
+                        day_profit = monthly_day_29_profit[0]
+                    elif day_number == 30:
+                        day_profit = monthly_day_30_profit[0]
+                    elif day_number == 31:
+                        day_profit = monthly_day_31_profit[0]
+
+                    daily_date_text = selected_month_name + ' ' + str(day_number)
+                    daily_amount_text = '$' + str(round(day_profit, 2))
+                    report_text += (
+                        '\n| ' + daily_date_text.ljust(label_width)
+                        + ' | ' + daily_amount_text.ljust(value_width) + ' |'
+                    )
+
+                report_text += '\n' + top_border
+            else:
+                report_text += '\n' + top_border
+
+            self._daily_report_label.text = report_text
+            self.chart.draw(self._daily_report_label)
+
+        # Bar number is intentionally omitted from chart drawings.
+
+        # ====================================================
+        # PRIMARY ENTRY MARKER
+        # ====================================================
+
+        marker_price = nan
+
+        if (
+            buy_signal
+            and not (
+                self.delete_setup == 'Primary BUY'
+                and self.bar_index == self.delete_bar_index
+            )
+        ):
+
+            marker_price = self.low[0] - entry_marker_offset
+
+        elif (
+            sell_signal
+            and not (
+                self.delete_setup == 'Primary SELL'
+                and self.bar_index == self.delete_bar_index
+            )
+        ):
+
+            marker_price = self.high[0] + entry_marker_offset
+
+        marker_color = (
+            color.RED
+            if buy_signal or sell_signal
+            else color.TRANSPARENT
+        )
+
+        # ====================================================
+        # OUTPUT
+        # ====================================================
+
+        return (
+            ema9[0],
+            ema20[0],
+            ema50[0],
+            ema200[0],
+
+            entry[0],
+            second_entry_price[0],
+            third_entry_price[0],
+            fourth_entry_price[0],
+            fifth_entry_price[0],
+
+            sl[0],
+            tp[0],
+
+            plot.Fill(),
+            plot.Fill(),
+
+            plot.Marker(
+                value=marker_price,
+                color=marker_color
+            )
+        )
+ + str(round(report_active_pnl[0], 2))).ljust(value_width) + ' |'
+            )
+            wins_row = (
+                '| ' + 'Winning Trades'.ljust(label_width) + ' | '
+                + str(win_count).ljust(value_width) + ' |'
+            )
+            losses_row = (
+                '| ' + 'Losing Trades'.ljust(label_width) + ' | '
+                + str(loss_count).ljust(value_width) + ' |'
+            )
+            breakeven_row = (
+                '| ' + 'Breakeven Trades'.ljust(label_width) + ' | '
+                + str(breakeven_count).ljust(value_width) + ' |'
             )
 
             sl_row = (
