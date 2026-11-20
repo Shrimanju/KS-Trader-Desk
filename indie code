@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from dotenv import load_dotenv
 from decimal import Decimal
-APP_VERSION = "1.7.6"
+APP_VERSION = "1.7.7"
 UTC = timezone.utc
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -1609,10 +1609,10 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
         # the setup has already played out without an open position. Cancel it.
         # Never treat a pending order's TP as a position close.
         cancel_state = str(lock.get("state", "")).lower()
-        if cancel_state == "pending_tp_cancel_requested":
+        if cancel_state in {"pending_exit_cancel_requested", "pending_order_cancel_rejected"}:
             store.set_json("trade_lock", lock)
             logging.warning(
-                "PENDING ORDER CANCELLATION IS STILL BEING RECONCILED for order %s. No new order will be submitted until Exness confirms its final state.",
+                "PENDING ORDER EXIT/CANCELLATION IS STILL BEING RECONCILED for order %s. No new order will be submitted until Exness confirms its final state.",
                 lock.get("order_id"),
             )
             return True
@@ -1620,32 +1620,43 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
         side = str(found.get("direction") or lock.get("side") or "").lower()
         entry_raw = found.get("price") or lock.get("entry")
         tp_raw = found.get("take_profit_price") or lock.get("tp")
-        tp_crossed_before_entry = False
-        if m1 is not None and not m1.empty and side in {"buy", "sell"} and entry_raw not in (None, "") and tp_raw not in (None, ""):
+        sl_raw = found.get("stop_loss_price") or lock.get("sl")
+        unfilled_exit_reason = None
+        touched_level = None
+
+        # A pending LIMIT order is invalidated when its attached SL or TP level
+        # is reached while the candle's full range remains on the pre-entry side.
+        # This proves the entry price was not touched during this completed M1 bar.
+        if m1 is not None and not m1.empty and side in {"buy", "sell"} and entry_raw not in (None, ""):
             last = m1.iloc[-1]
             entry_price = float(dec(entry_raw))
-            tp_price = float(dec(tp_raw))
             candle_high = float(last["high"])
             candle_low = float(last["low"])
-            if side == "sell":
-                # Sell Limit entry is above market; TP is below entry.
-                tp_crossed_before_entry = candle_low <= tp_price and candle_high < entry_price
-            else:
-                # Buy Limit entry is below market; TP is above entry.
-                tp_crossed_before_entry = candle_high >= tp_price and candle_low > entry_price
+            entry_not_touched = (
+                candle_high < entry_price if side == "sell"
+                else candle_low > entry_price
+            )
+            if entry_not_touched:
+                for reason, raw_level in (("SL", sl_raw), ("TP", tp_raw)):
+                    if raw_level not in (None, ""):
+                        level = float(dec(raw_level))
+                        if candle_low <= level <= candle_high:
+                            unfilled_exit_reason = reason
+                            touched_level = raw_level
+                            break
 
-        if tp_crossed_before_entry:
+        if unfilled_exit_reason:
             order_id = str(found.get("order_id") or "")
             if not order_id:
-                raise RuntimeError("Pending order reached its TP before entry but Exness did not provide order_id; refusing to guess which order to cancel.")
+                raise RuntimeError("Pending order reached its SL/TP before entry but Exness did not provide order_id; refusing to guess which order to cancel.")
             cancel_idem = "KS-CANCEL-" + uuid.uuid4().hex
-            lock["state"] = "pending_tp_cancel_requested"
-            lock["cancel_reason"] = "tp_reached_before_entry"
+            lock["state"] = "pending_exit_cancel_requested"
+            lock["cancel_reason"] = f"{unfilled_exit_reason.lower()}_reached_before_entry"
             lock["cancel_requested_at"] = utc_iso(datetime.now(UTC))
             store.set_json("trade_lock", lock)
             logging.warning(
-                "INVALID PENDING SETUP: %s LIMIT order %s reached its TP (%s) before entry (%s). Requesting cancellation; this is NOT recorded as a trade win/loss.",
-                side.upper(), order_id, tp_raw, entry_raw,
+                "INVALID PENDING SETUP: %s LIMIT order %s reached %s (%s) before entry (%s). Requesting cancellation; this is NOT recorded as a trade win/loss.",
+                side.upper(), order_id, unfilled_exit_reason, touched_level, entry_raw,
             )
             try:
                 ack = api.cancel_pending_order(order_id, idem=cancel_idem)
@@ -1672,11 +1683,14 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
                             return True
                         lock.update({
                             "active": False,
-                            "state": "cancelled_unfilled_tp_reached",
+                            "state": f"cancelled_unfilled_{unfilled_exit_reason.lower()}_reached",
                             "resolved_at": utc_iso(datetime.now(UTC)),
                         })
                         store.set_json("trade_lock", lock)
-                        logging.info("PENDING ORDER CANCELLED: TP was reached before entry. No position was opened, no P/L is booked, and the bot can look for a fresh setup.")
+                        logging.info(
+                            "PENDING ORDER CANCELLED: %s was reached before entry. No position was opened, no P/L is booked, and the bot can look for a fresh setup.",
+                            unfilled_exit_reason,
+                        )
                         return False
                     if op_state in {"rejected", "failed"}:
                         lock["state"] = "pending_order_cancel_rejected"
