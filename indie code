@@ -1494,6 +1494,11 @@ class Main(MainContext):
             pending_trade_stale = self.bar_index > pending_trade_setup_bar[0] + 1.0
             pending_entry_valid = False
 
+            # Declare these in the pending-entry scope because Indie variables
+            # declared inside a nested if are not visible after that block.
+            pending_calculated_lot = 0.0
+            pending_calculated_risk_cash = nan
+
             # If this is the first bar after the setup, use its OPEN as the
             # fill. Recalculate SL distance, lot size and TP from that price.
             if not pending_trade_stale:
@@ -1522,9 +1527,6 @@ class Main(MainContext):
                 pending_risk_per_lot = pending_risk_distance * self.contract_size
                 pending_total_risk_percent = total_risk_percent
                 pending_risk_budget_cash = self.account_capital * pending_total_risk_percent / 100.0
-                pending_calculated_lot = 0.0
-                pending_calculated_risk_cash = nan
-
                 if (
                     pending_stop_valid
                     and pending_risk_distance > 0.0
