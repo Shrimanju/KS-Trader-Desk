@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from dotenv import load_dotenv
 from decimal import Decimal
-APP_VERSION = "1.7.7"
+APP_VERSION = "1.7.8"
 UTC = timezone.utc
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -1940,7 +1940,7 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
             latest_close_time, latest_close_deal, latest_close_order = confirmed_closes[-1]
             exit_order = latest_close_order
             exit_reason = (
-                "MARKET"
+                "MANUAL"
                 if str(latest_close_order.get("order_type", "")).lower() == "market"
                 else "EXTERNAL"
             )
@@ -2012,7 +2012,7 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
         if market_close_metadata:
             realized = market_close_metadata.get("realized_profit")
             pnl_text = f" | Realized P/L: ${float(dec(realized)):.2f}" if realized not in (None, "") else ""
-            close_kind = "MANUAL / MARKET EXIT" if exit_reason == "MARKET" else "EXTERNAL EXIT"
+            close_kind = "MANUAL EXIT" if exit_reason == "MANUAL" else "EXTERNAL EXIT"
             logging.info(
                 "TRADE CLOSED: %s | Position %s | Fully closed volume %s / %s%s. New signals can be considered.",
                 close_kind, locked_position_id,
@@ -2021,6 +2021,12 @@ def refresh_trade_lock(store: StateStore, api: ExnessAPI, snapshot: dict, instru
         else:
             close_label = "TAKE PROFIT" if exit_reason == "TP" else "STOP LOSS"
             logging.info("TRADE CLOSED: Exness confirms %s was hit for position %s. The bot can watch for the next valid setup.", close_label, locked_position_id)
+
+        if exit_reason in {"MANUAL", "EXTERNAL"}:
+            logging.info(
+                "MANUAL / EXTERNAL EXIT CONFIRMED: Position %s is fully closed. The trade lock is released; the bot can evaluate the next valid entry. This exit is excluded from the SL/TP-only daily risk protection ledger.",
+                locked_position_id,
+            )
         return False
 
     lock["state"] = "awaiting_sl_tp_confirmation"
