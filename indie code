@@ -27,7 +27,7 @@ from indie.drawings import (
 
 # Adaptive hybrid trailing is a visual/backtest stop manager for M1 charts.
 
-# Entry 1 uses the original candle midpoint: (high + low) / 2.
+# Entry 1 uses adaptive confirmation-close or 50% pullback-rejection execution.
 # It does not send or modify broker orders.
 
 # ============================================================
@@ -1279,7 +1279,6 @@ class Main(MainContext):
         )
 
         # ====================================================
-        # ====================================================
         # ADAPTIVE PRIMARY-ENTRY MOMENTUM CLASSIFICATION
         # 4/5 confirmations = strong momentum (close entry).
         # Otherwise = moderate momentum (wait for 50% pullback).
@@ -2088,7 +2087,11 @@ if self.is_closed_bar:
             # ARM NEW BREAKOUT PULLBACK SETUPS
             # ================================================
 
-            if side[0] == 0.0 and not trade_exited:
+            if (
+                side[0] == 0.0
+                and pending_trade_side[0] == 0.0
+                and not trade_exited
+            ):
 
                 if bullish_breakout_volume_setup:
 
