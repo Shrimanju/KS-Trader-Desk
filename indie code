@@ -27,7 +27,7 @@ from indie.drawings import (
 
 # Adaptive hybrid trailing is a visual/backtest stop manager for M1 charts.
 
-# Entry 1 is simulated at the next candle OPEN after signal confirmation closes.
+# Entry 1 is always simulated at the next candle OPEN after signal confirmation closes.
 # It does not send or modify broker orders.
 
 # ============================================================
@@ -469,6 +469,7 @@ class Main(MainContext):
         realized_exit_price = nan
         realized_pnl = nan
 
+        # No maximum SL-distance rejection in always-enter mode.
         maximum_allowed_sl_distance = 15.0
 
         buy_breakout_pullback_ready = False
@@ -1491,59 +1492,59 @@ class Main(MainContext):
             pending_actual_sl = nan
             pending_tp_value = nan
 
-            pending_trade_stale = self.bar_index > pending_trade_setup_bar[0] + 1.0
             pending_entry_valid = False
 
-            # Declare these in the pending-entry scope because Indie variables
-            # declared inside a nested if are not visible after that block.
-            pending_calculated_lot = 0.0
+            # Declare calculated values in this enclosing scope. Indie limits
+            # the visibility of variables declared inside nested if blocks.
+            pending_calculated_lot = 0.01
             pending_calculated_risk_cash = nan
 
-            # If this is the first bar after the setup, use its OPEN as the
-            # fill. Recalculate SL distance, lot size and TP from that price.
-            if not pending_trade_stale:
-                # Reject a gap through the original 8-candle structure.
-                # Rebuild the existing protective buffer from the actual fill.
-                pending_stop_valid = (
-                    pending_structure_sl < pending_entry_value
-                    if pending_side_value == 1.0
-                    else pending_structure_sl > pending_entry_value
+            # Always activate the signal at this next available candle OPEN.
+            # If price has crossed the original structural stop, the min/max
+            # below resets the protective stop to the existing buffer on the
+            # correct side of the new entry.
+            pending_entry_stop_buffer = max(
+                pending_signal_range * 0.25,
+                abs(pending_entry_value) * 0.00005
+            )
+            if pending_side_value == 1.0:
+                pending_actual_sl = min(
+                    pending_structure_sl,
+                    pending_entry_value - pending_entry_stop_buffer
                 )
-                pending_entry_stop_buffer = max(
-                    pending_signal_range * 0.25,
-                    abs(pending_entry_value) * 0.00005
+            else:
+                pending_actual_sl = max(
+                    pending_structure_sl,
+                    pending_entry_value + pending_entry_stop_buffer
                 )
-                if pending_side_value == 1.0:
-                    pending_actual_sl = min(
-                        pending_structure_sl,
-                        pending_entry_value - pending_entry_stop_buffer
-                    )
-                else:
-                    pending_actual_sl = max(
-                        pending_structure_sl,
-                        pending_entry_value + pending_entry_stop_buffer
-                    )
-                pending_risk_distance = abs(pending_entry_value - pending_actual_sl)
-                pending_risk_per_lot = pending_risk_distance * self.contract_size
-                pending_total_risk_percent = total_risk_percent
-                pending_risk_budget_cash = self.account_capital * pending_total_risk_percent / 100.0
-                if (
-                    pending_stop_valid
-                    and pending_risk_distance > 0.0
-                    and pending_risk_distance <= maximum_allowed_sl_distance
-                    and pending_risk_per_lot > 0.0
-                    and pending_risk_budget_cash > 0.0
-                ):
-                    pending_raw_lot = pending_risk_budget_cash / pending_risk_per_lot
-                    pending_calculated_lot = int(pending_raw_lot * 100.0) / 100.0
-                    pending_calculated_risk_cash = pending_calculated_lot * pending_risk_per_lot
 
-                    if pending_calculated_lot >= 0.01:
-                        pending_entry_valid = True
-                        if pending_side_value == 1.0:
-                            pending_tp_value = pending_entry_value + pending_risk_distance * rr_multiplier
-                        else:
-                            pending_tp_value = pending_entry_value - pending_risk_distance * rr_multiplier
+            # Recalculate lot from the actual entry and adjusted stop.
+            # There is intentionally no 15-point rejection or risk-budget
+            # rejection. The minimum order size is forced to 0.01 lots.
+            pending_risk_distance = abs(pending_entry_value - pending_actual_sl)
+            pending_risk_per_lot = pending_risk_distance * self.contract_size
+            pending_total_risk_percent = total_risk_percent
+            pending_risk_budget_cash = (
+                self.account_capital * pending_total_risk_percent / 100.0
+            )
+            pending_raw_lot = pending_risk_budget_cash / pending_risk_per_lot
+            pending_calculated_lot = int(pending_raw_lot * 100.0) / 100.0
+            if pending_calculated_lot < 0.01:
+                pending_calculated_lot = 0.01
+
+            pending_calculated_risk_cash = (
+                pending_calculated_lot * pending_risk_per_lot
+            )
+            pending_entry_valid = True
+
+            if pending_side_value == 1.0:
+                pending_tp_value = (
+                    pending_entry_value + pending_risk_distance * rr_multiplier
+                )
+            else:
+                pending_tp_value = (
+                    pending_entry_value - pending_risk_distance * rr_multiplier
+                )
 
             if pending_entry_valid:
                 entry[0] = pending_entry_value
@@ -2752,10 +2753,6 @@ class Main(MainContext):
                 '| ' + 'Active Trades'.ljust(label_width) + ' | '
                 + str(active_trades).ljust(value_width) + ' |'
             )
-            inactive_row = (
-                '| ' + 'Inactive Trades'.ljust(label_width) + ' | '
-                + str(inactive_trades).ljust(value_width) + ' |'
-            )
             total_row = (
                 '| ' + 'Total trades'.ljust(label_width) + ' | '
                 + str(total_trades).ljust(value_width) + ' |'
@@ -2764,10 +2761,6 @@ class Main(MainContext):
             active_pnl_row = (
                 '| ' + 'Active Trade P/L'.ljust(label_width) + ' | '
                 + ('$' + str(round(report_active_pnl[0], 2))).ljust(value_width) + ' |'
-            )
-            inactive_pnl_row = (
-                '| ' + 'Invalid / Unfilled Setups'.ljust(label_width) + ' | '
-                + str(inactive_trades).ljust(value_width) + ' |'
             )
 
             sl_row = (
@@ -2815,10 +2808,8 @@ class Main(MainContext):
                 + date_row + '\n'
                 + timeframe_row + '\n'
                 + active_row + '\n'
-                + inactive_row + '\n'
                 + total_row + '\n'
                 + active_pnl_row + '\n'
-                + inactive_pnl_row + '\n'
                 + sl_row + '\n'
                 + tp_row + '\n'
                 + trailing_sl_row + '\n'
