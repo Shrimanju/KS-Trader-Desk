@@ -2547,20 +2547,6 @@ def run_dynamic_take_profit(store: StateStore, api: ExnessAPI, snapshot: dict,
         for req in state.get("requests", []) or []:
             if req.get("confirmed"):
                 continue
-            op_state = "confirmed"
-            if req.get("operation_id"):
-                try:
-                    doc = api.operation_status(str(req["operation_id"]))
-                    op_state = str(doc.get("status", "")).lower()
-                except Exception:
-                    op_state = "processing"
-            if op_state in {"rejected", "failed"}:
-                req["status"] = "rejected"
-                all_ok = False
-                continue
-            if op_state not in {"confirmed", "completed", "succeeded", "success"}:
-                all_ok = False
-                continue
             if req.get("kind") == "position":
                 linked = _find_position_sltp_order(fresh, instrument, str(req.get("position_id") or ""))
                 current_value = (linked or {}).get("take_profit_price")
@@ -2568,7 +2554,55 @@ def run_dynamic_take_profit(store: StateStore, api: ExnessAPI, snapshot: dict,
                 order = next((o for o in (fresh.get("orders", []) or []) if str(o.get("order_id", "")) == str(req.get("order_id", ""))), None)
                 current_value = (order or {}).get("take_profit_price")
             req["confirmed"] = _history_decimal_equal(current_value, state.get("target_text"))
-            all_ok = all_ok and bool(req["confirmed"])
+            if req["confirmed"]:
+                req["status"] = "confirmed"
+                continue
+
+            op_state = "confirmed"
+            if req.get("operation_id"):
+                try:
+                    doc = api.operation_status(str(req["operation_id"]))
+                    op_state = str(doc.get("status", "")).lower()
+                except Exception:
+                    op_state = "processing"
+            if op_state not in {"confirmed", "completed", "succeeded", "success", "rejected", "failed"}:
+                all_ok = False
+                continue
+
+            # Acknowledgement alone is not success. If the broker has not
+            # reflected the target after the cooldown, retry with a fresh
+            # idempotency key; never resend while the prior operation is pending.
+            requested_at = _history_time(req.get("requested_at"))
+            age = (datetime.now(UTC) - requested_at).total_seconds() if requested_at else 999999
+            retry_count = int(req.get("retry_count", 0))
+            if age >= 15 and retry_count < 3:
+                retry_count += 1
+                suffix = "-R" + str(retry_count)
+                base_idem = str(req.get("idempotency_key") or (
+                    "KS-DYNAMIC-TP-" + re.sub(
+                        r"[^A-Za-z0-9_-]", "",
+                        str(group.get("group_id", "")) + "-" + str(state.get("bar_time", "")) + "-" +
+                        str(req.get("position_id") or req.get("order_id"))
+                    )
+                ))
+                idem = base_idem + suffix
+                try:
+                    if req.get("kind") == "position":
+                        ack = api.modify_active_order(str(req["order_id"]), None, idem, take_profit_text=str(state["target_text"]))
+                    else:
+                        ack = api.modify_pending_order(str(req["order_id"]), idem=idem, take_profit_text=str(state["target_text"]))
+                    req["operation_id"] = str(ack.get("operation_id") or "") or None
+                    req["idempotency_key"] = base_idem
+                    req["requested_at"] = utc_iso(datetime.now(UTC))
+                    req["retry_count"] = retry_count
+                    req["status"] = "retry_requested"
+                except Exception as exc:
+                    req["requested_at"] = utc_iso(datetime.now(UTC))
+                    req["retry_count"] = retry_count
+                    req["status"] = "retry_uncertain"
+                    req["error"] = str(exc)[:180]
+                    logging.error("DYNAMIC TP RETRY UNCERTAIN | %s | %s", req.get("order_id"), str(exc)[:150])
+            all_ok = False
         if all_ok:
             group["tp_text"] = str(state["target_text"])
             for leg in group.get("legs", []) or []:
@@ -2629,9 +2663,15 @@ def run_dynamic_take_profit(store: StateStore, api: ExnessAPI, snapshot: dict,
                 else:
                     ack=api.modify_pending_order(req["order_id"],idem=idem,take_profit_text=target_text)
                 req["operation_id"]=str(ack.get("operation_id") or "") or None
+                req["idempotency_key"]=idem
+                req["retry_count"]=int(req.get("retry_count",0))
                 req["requested_at"]=utc_iso(datetime.now(UTC))
+                req["status"]="requested"
             except Exception as exc:
                 req["status"]="rejected"
+                req["idempotency_key"]=idem
+                req["requested_at"]=utc_iso(datetime.now(UTC))
+                req["retry_count"]=int(req.get("retry_count",0))
                 req["error"]=str(exc)[:200]
                 logging.error("DYNAMIC TP PATCH FAILED | order=%s | %s",req.get("order_id"),str(exc)[:140])
         store.set_json("trade_group",group)
@@ -3899,8 +3939,11 @@ def refresh_trade_group_lock(store: StateStore, api: ExnessAPI, snapshot: dict,
     # originating candle boundary. This is not reported as a TP/SL loss.
     if not group_exit and not group.get("active_triggered") and m1 is not None and not m1.empty:
         close_now = float(m1.iloc[-1]["close"])
-        setup_high, setup_low = float(dec(group.get("signal_high"))), float(dec(group.get("signal_low")))
-        invalid = (side == "buy" and close_now < setup_low) or (side == "sell" and close_now > setup_high)
+        setup_high_raw, setup_low_raw = group.get("signal_high"), group.get("signal_low")
+        invalid = False
+        if setup_high_raw not in (None, "") and setup_low_raw not in (None, ""):
+            setup_high, setup_low = float(dec(setup_high_raw)), float(dec(setup_low_raw))
+            invalid = (side == "buy" and close_now < setup_low) or (side == "sell" and close_now > setup_high)
         if invalid:
             group_exit = {"reason":"SETUP_INVALIDATED","price":close_now,
                           "detected_at":utc_iso(datetime.now(UTC)),
@@ -6340,7 +6383,7 @@ def main() -> int:
                         store.set_json("trade_group",event_group)
                         reconcile_group_opposite_signal_exit(store,api,snap,cfg.instrument)
                         snap=api.snapshot()
-                        refresh_trade_lock(store,api,snap,cfg.instrument,m1,tick_monitor.latest())
+                        refresh_trade_lock(store,api,snap,cfg.instrument,m1,tick_monitor.latest() if tick_monitor is not None else None)
                     elif event_type == "PENDING_SETUP_INVALIDATED":
                         event_group["group_exit_event"] = {
                             "reason":"SETUP_INVALIDATED",
@@ -6349,7 +6392,7 @@ def main() -> int:
                             "source":"opposite_confirmed_setup_before_fill",
                         }
                         store.set_json("trade_group",event_group)
-                        refresh_trade_lock(store,api,api.snapshot(),cfg.instrument,m1,tick_monitor.latest())
+                        refresh_trade_lock(store,api,api.snapshot(),cfg.instrument,m1,tick_monitor.latest() if tick_monitor is not None else None)
                 if event_group:
                     store.set_json("trade_group",event_group)
                 store.set_json("confirmed_setup", {})
