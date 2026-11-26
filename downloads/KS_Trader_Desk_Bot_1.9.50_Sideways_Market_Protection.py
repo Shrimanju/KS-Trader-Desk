@@ -41,7 +41,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from dotenv import load_dotenv
 from decimal import Decimal
-APP_VERSION = "1.9.49-risk-safe-group-dashboard"  # Indie Entry 1/2 only + pre-entry checklist
+APP_VERSION = "1.9.50-sideways-market-protection"  # Indie Entry 1/2 only + pre-entry checklist
 UTC = timezone.utc
 IST = ZoneInfo("Asia/Kolkata")
 _RECENT_EXNESS_DEALS_CACHE: dict[str, Any] = {}
