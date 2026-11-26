@@ -2378,8 +2378,15 @@ class Main(MainContext):
             elif pending_second_side[0] == -1.0:
                 old_secondary_entry_touched = self.high[0] >= pending_second_entry[0]
 
+            invalid_pending_boundary = False
+            if pending_side_value == 1.0 and pending_trade_setup_low[0] == pending_trade_setup_low[0]:
+                invalid_pending_boundary = self.close[0] < pending_trade_setup_low[0]
+            elif pending_side_value == -1.0 and pending_trade_setup_high[0] == pending_trade_setup_high[0]:
+                invalid_pending_boundary = self.close[0] > pending_trade_setup_high[0]
+
             if (
-                opposite_new_setup and side[0] == 0.0 and second_active_side[0] == 0.0
+                (opposite_new_setup or invalid_pending_boundary)
+                and side[0] == 0.0 and second_active_side[0] == 0.0
                 and not old_primary_entry_touched and not old_primary_sl_touched
                 and not old_primary_tp_touched and not old_secondary_entry_touched
             ):
