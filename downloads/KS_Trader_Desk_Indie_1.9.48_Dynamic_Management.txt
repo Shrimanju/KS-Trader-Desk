@@ -2770,6 +2770,37 @@ class Main(MainContext):
             pass
 
             # ================================================
+            # CONFIRMED OPPOSITE-SIGNAL CHECK (M1 CLOSE)
+            # Run before EXITS so the simulated close matches the Python
+            # engine's completed-candle reversal confirmation.
+            # ================================================
+            if self.is_closed_bar and self._is_m1_chart and side[0] == 1.0 and early_exit_warned[0] == 0.0:
+                buy_failure_score = 0
+                if self.close[0] < ema20[0] and ema20[0] < ema50[0]:
+                    buy_failure_score += 1
+                if htf_sell:
+                    buy_failure_score += 1
+                if rsi[0] < 45 and rsi[0] < rsi[1]:
+                    buy_failure_score += 1
+                if bearish_price_action:
+                    buy_failure_score += 1
+                if buy_failure_score >= 3:
+                    early_exit_warned[0] = 1.0
+
+            elif self.is_closed_bar and self._is_m1_chart and side[0] == -1.0 and early_exit_warned[0] == 0.0:
+                sell_failure_score = 0
+                if self.close[0] > ema20[0] and ema20[0] > ema50[0]:
+                    sell_failure_score += 1
+                if htf_buy:
+                    sell_failure_score += 1
+                if rsi[0] > 55 and rsi[0] > rsi[1]:
+                    sell_failure_score += 1
+                if bullish_price_action:
+                    sell_failure_score += 1
+                if sell_failure_score >= 3:
+                    early_exit_warned[0] = 1.0
+
+            # ================================================
             # EXITS
             # ================================================
 
