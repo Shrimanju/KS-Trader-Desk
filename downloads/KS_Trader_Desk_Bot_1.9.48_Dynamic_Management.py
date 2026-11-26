@@ -6265,7 +6265,8 @@ def main() -> int:
             unresolved = pending_submission_blocks(store, api, snap, cfg.instrument)
             # Run once per newly completed M1 candle. Pending orders are ignored;
             # only an actually open position with its linked active SLTP order is managed.
-            if trade_locked and open_positions and cfg.trading_enabled:
+            if trade_locked and open_positions:
+                # Position management remains active even when new entries are disabled.
                 run_dynamic_take_profit(store, api, snap, m1, conditions, cfg.instrument)
                 snap = api.snapshot()
             if trade_locked and open_positions and trailing_enabled:
