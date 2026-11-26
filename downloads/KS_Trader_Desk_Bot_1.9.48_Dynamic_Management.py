@@ -1448,10 +1448,10 @@ def classify_signal_group(entry_triggered: bool, retrace_percent: float = 0.0) -
 def _auto_structure_rr_multiplier(history: pd.DataFrame, index: int, side: str,
                                   entry: float, risk: float, signal_range: float) -> float | None:
     """Select the highest RR tier fitting the prior ten candles' opposing structure."""
-    if risk <= 0.0 or index < 5:
+    if risk <= 0.0 or index < 10:
         return None
-    prior = history.iloc[max(0, index - 10):index]
-    if len(prior) < 5:
+    prior = history.iloc[index - 10:index]
+    if len(prior) < 10:
         return None
     buffer = max(float(signal_range) * 0.15, float(risk) * 0.03)
     room = (float(prior["high"].max()) - float(entry) - buffer) if side == "buy" else (float(entry) - float(prior["low"].min()) - buffer)
@@ -2456,7 +2456,11 @@ def reconcile_group_opposite_signal_exit(store: StateStore, api: ExnessAPI,
                     leg["status"] = "closed"
                     leg["closed_at"] = utc_iso(datetime.now(UTC))
                 else:
+                    # The operation completed but the position is still in
+                    # Exness' active snapshot. Clear this operation ID so a
+                    # fresh close can be retried after the cooldown if needed.
                     op["status"] = "awaiting_position_snapshot"
+                    op["operation_id"] = None
                     operations[pid] = op
                 continue
             if op_state not in {"rejected", "failed"}:
